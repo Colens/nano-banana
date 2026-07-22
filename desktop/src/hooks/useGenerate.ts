@@ -1,0 +1,739 @@
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { useConfigStore } from '../store/configStore';
+import { useGenerateStore } from '../store/generateStore';
+import { generateBatch, generateBatchWithImages, getTaskStatus } from '../services/generateApi';
+import { useTaskStream } from './useTaskStream';
+import { setUpdateSource, getUpdateSource, clearUpdateSource } from '../store/updateSourceStore';
+import { toast } from '../store/toastStore';
+import { usePromptHistoryStore } from '../store/promptHistoryStore';
+import { useHistoryStore } from '../store/historyStore';
+import i18n from '../i18n';
+import { getDiagnosticVerbose } from '../utils/diagnosticLogger';
+import { getPromptOptimizeConfigIssue } from '../utils/promptOptimizeConfig';
+import { isQualityControlSupported, isReferenceImageSupported, isUsingNativeImageSize } from '../store/configStore';
+
+// 流式连接建立超时时间（毫秒）- 超过此时间未建立连接则启动轮询
+// 本地后端通常不会推实时进度，过长会导致用户"卡住"的观感
+const STREAM_OPEN_TIMEOUT = 3000;
+// 轮询间隔（毫秒）
+const POLL_INTERVAL = 3000;
+// 最大轮询重试次数（降低到 6 次，避免用户等待过久）
+const MAX_POLL_RETRIES = 6;
+// 最大退避间隔（毫秒）（降低到 15 秒）
+const MAX_BACKOFF_INTERVAL = 15000;
+const BATCH_TASK_PREFIX = 'batch-';
+// 主动同步间隔（毫秒）- 作为 SSE/轮询的兜底机制，定期检查后端状态
+const ACTIVE_SYNC_INTERVAL = 8000;
+
+const isBatchTaskId = (value: string | null | undefined) => {
+  if (!value) return false;
+  return value.startsWith(BATCH_TASK_PREFIX);
+};
+
+const sleep = (ms: number) => new Promise<void>((resolve) => {
+  setTimeout(resolve, ms);
+});
+
+const normalizeRefPath = (value: string) => value.replace(/\\/g, '/').replace(/\/+/g, '/');
+const isWindowsAbsolutePath = (value: string) => /^[a-zA-Z]:[\\/]/.test(value) || value.startsWith('\\\\');
+const isAbsoluteRefPath = (value: string) => value.startsWith('/') || isWindowsAbsolutePath(value);
+const isStorageRelativeRefPath = (value: string) => {
+  const normalized = normalizeRefPath(value);
+  return normalized.startsWith('/storage/') || normalized.startsWith('storage/');
+};
+
+async function resolveRefPathForUpload(rawPath: string): Promise<string> {
+  const trimmed = String(rawPath || '').trim();
+  if (!trimmed) return '';
+
+  const normalized = normalizeRefPath(trimmed);
+  if (isAbsoluteRefPath(normalized) && !isStorageRelativeRefPath(normalized)) {
+    return normalized;
+  }
+
+  if (window.__TAURI_INTERNALS__ && isStorageRelativeRefPath(normalized)) {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      const appDataDir = await invoke<string>('get_app_data_dir');
+      const base = normalizeRefPath(String(appDataDir || '').trim()).replace(/\/+$/, '');
+      const relative = normalized.replace(/^\/+/, '');
+      if (base) {
+        return `${base}/${relative}`;
+      }
+    } catch (error) {
+      console.warn('[useGenerate] resolve storage ref path failed:', error);
+    }
+  }
+
+  return '';
+}
+
+export function useGenerate() {
+  const config = useConfigStore();
+  const { startTask, status, taskId, failTask, updateProgress, updateProgressBatch, completeTask, setConnectionMode, connectionMode, setSubmitting, isSubmitting: isStoreSubmitting } = useGenerateStore();
+  const resetPromptHistory = usePromptHistoryStore((s) => s.reset);
+  const [isInternalSubmitting, setIsInternalSubmitting] = useState(false);
+
+  const isSubmitting = isInternalSubmitting || isStoreSubmitting;
+
+  // 轮询相关引用
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const timeoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isPollingRef = useRef(false);
+  const pollRetryCountRef = useRef(0); // 轮询重试计数器
+  const wsCloseRequestedRef = useRef(false); // 标记是否主动请求关闭WebSocket
+  const basePollIntervalRef = useRef(POLL_INTERVAL); // 基础轮询间隔，用于指数退避
+  const expectedTaskIdRef = useRef<string | null>(null); // 记录期望的任务ID，防止闭包陷阱
+  // 主动同步定时器引用 - 作为 SSE/轮询的兜底机制
+  const activeSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // 使用 ref 存储最新的 store 函数，避免闭包问题
+  const storeRef = useRef({
+    failTask,
+    updateProgress,
+    updateProgressBatch,
+    completeTask,
+    setConnectionMode
+  });
+  storeRef.current = { failTask, updateProgress, updateProgressBatch, completeTask, setConnectionMode };
+
+  // 启用 SSE 监听当前任务
+  useTaskStream(status === 'processing' ? taskId : null);
+
+  // 停止轮询
+  const stopPolling = useCallback(() => {
+    isPollingRef.current = false;
+    wsCloseRequestedRef.current = false; // 重置WebSocket关闭标记
+    pollRetryCountRef.current = 0; // 重置重试计数
+    if (pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+    if (timeoutTimerRef.current) {
+      clearTimeout(timeoutTimerRef.current);
+      timeoutTimerRef.current = null;
+    }
+    // 竞态条件修复：清理更新源标记
+    if (getUpdateSource() === 'polling') {
+      setUpdateSource(null);
+    }
+    // Bug #3修复：停止轮询时重置connectionMode为none
+    storeRef.current.setConnectionMode('none');
+  }, []);
+
+  // 停止主动同步
+  const stopActiveSync = useCallback(() => {
+    if (activeSyncTimerRef.current) {
+      clearTimeout(activeSyncTimerRef.current);
+      activeSyncTimerRef.current = null;
+    }
+  }, []);
+
+  // 主动同步：定期检查后端状态，作为 SSE/轮询的兜底机制
+  const startActiveSync = useCallback((currentTaskId: string) => {
+    // 批量任务不启动主动同步（已有独立轮询逻辑）
+    if (isBatchTaskId(currentTaskId)) return;
+
+    // 记录任务开始时间
+    const startTime = Date.now();
+    const timeoutMs = (config.imageTimeoutSeconds || 500) * 1000;
+
+    const doSync = async () => {
+      try {
+        // 超时检测
+        const elapsed = Date.now() - startTime;
+        if (elapsed > timeoutMs) {
+          console.log('[active sync] Timeout detected, marking task as failed');
+          storeRef.current.failTask(i18n.t('generate.toast.timeout', { seconds: Math.round(timeoutMs / 1000) }));
+          stopActiveSync();
+          return;
+        }
+
+        // 检查当前状态是否仍在处理中
+        const currentState = useGenerateStore.getState();
+        if (currentState.status !== 'processing' || currentState.taskId !== currentTaskId) {
+          // 任务已结束或切换，停止同步
+          return;
+        }
+
+        // 从后端获取最新状态
+        const taskData = await getTaskStatus(currentTaskId);
+        const latestState = useGenerateStore.getState();
+
+        // 再次检查任务是否匹配（防止竞态）
+        if (latestState.taskId !== currentTaskId) return;
+
+        // 对比状态：如果后端已完成但本地仍在处理，同步更新
+        if (taskData.status !== 'processing' && latestState.status === 'processing') {
+          console.log('[active sync] Status mismatch detected, syncing:', {
+            local: latestState.status,
+            backend: taskData.status
+          });
+
+          // 更新进度
+          if (taskData.images && taskData.images.length > 0) {
+            storeRef.current.updateProgressBatch(taskData.completedCount, taskData.images);
+          } else {
+            storeRef.current.updateProgress(taskData.completedCount, null);
+          }
+
+          // 同步最终状态
+          if (taskData.status === 'completed') {
+            storeRef.current.completeTask();
+            stopActiveSync();
+            return;
+          } else if (taskData.status === 'failed') {
+            storeRef.current.failTask(taskData);
+            stopActiveSync();
+            return;
+          } else if (taskData.status === 'partial') {
+            storeRef.current.completeTask();
+            stopActiveSync();
+            return;
+          }
+        }
+
+        // 状态仍为 processing，继续定期同步
+        activeSyncTimerRef.current = setTimeout(doSync, ACTIVE_SYNC_INTERVAL);
+      } catch (error) {
+        console.error('[active sync] Error:', error);
+        // 出错时继续尝试，不中断同步
+        activeSyncTimerRef.current = setTimeout(doSync, ACTIVE_SYNC_INTERVAL);
+      }
+    };
+
+    // 启动同步
+    activeSyncTimerRef.current = setTimeout(doSync, ACTIVE_SYNC_INTERVAL);
+  }, [stopActiveSync, config.imageTimeoutSeconds]);
+
+  // 轮询函数：检查任务状态
+  const startPolling = useCallback(async (currentTaskId: string) => {
+    const currentState = useGenerateStore.getState();
+    if (
+      isPollingRef.current ||
+      currentState.status !== 'processing' ||
+      currentState.taskId !== currentTaskId ||
+      isBatchTaskId(currentTaskId)
+    ) {
+      return;
+    }
+
+    // 进入 polling 模式时由 polling 接管更新源（避免 websocket 标记残留导致轮询无法启动）
+    if (getUpdateSource() === 'websocket') {
+      setUpdateSource(null);
+    }
+    setUpdateSource('polling');
+
+    isPollingRef.current = true;
+    pollRetryCountRef.current = 0; // 重置重试计数
+    basePollIntervalRef.current = POLL_INTERVAL; // 重置基础间隔
+
+    // Bug修复：先检查当前是否已经是polling模式，避免重复设置
+    const currentMode = useGenerateStore.getState().connectionMode;
+    if (currentMode !== 'polling') {
+      wsCloseRequestedRef.current = true; // 标记请求关闭WebSocket
+      storeRef.current.setConnectionMode('polling');
+    }
+
+    const poll = async () => {
+      try {
+        // 竞态条件修复：再次检查当前更新源
+        if (getUpdateSource() !== 'polling') {
+          console.log('[race guard] polling interrupted, source switched');
+          // 允许后续再次启动轮询（避免卡住）
+          isPollingRef.current = false;
+          return;
+        }
+
+        // 响应拦截器已返回 ApiResponse.data，即 GenerationTask
+        const taskData = await getTaskStatus(currentTaskId);
+
+        // 重置重试计数和间隔（成功后）
+        pollRetryCountRef.current = 0;
+        basePollIntervalRef.current = POLL_INTERVAL;
+
+        // 更新进度 - 使用批量更新减少重复渲染
+        if (taskData.images && taskData.images.length > 0) {
+          storeRef.current.updateProgressBatch(taskData.completedCount, taskData.images);
+        } else {
+          storeRef.current.updateProgress(taskData.completedCount, null);
+        }
+
+        // 检查任务是否完成
+        if (taskData.status === 'completed' || taskData.status === 'failed') {
+          if (
+            taskData.status === 'completed' &&
+            taskData.totalCount > 1 &&
+            (taskData.images?.length || 0) < taskData.totalCount
+          ) {
+            toast.info(i18n.t('generate.toast.countMismatch', {
+              total: taskData.totalCount,
+              returned: taskData.images?.length || 0
+            }));
+          }
+
+          stopPolling();
+          if (taskData.status === 'completed') {
+            storeRef.current.completeTask();
+          } else {
+            storeRef.current.failTask(taskData);
+          }
+          return;
+        }
+
+        // 继续轮询（使用当前间隔）
+        pollTimerRef.current = setTimeout(poll, basePollIntervalRef.current);
+      } catch (error) {
+        console.error('Polling error:', error);
+
+        // 检查重试次数
+        pollRetryCountRef.current++;
+        if (pollRetryCountRef.current >= MAX_POLL_RETRIES) {
+          console.error('Polling max retries reached, giving up');
+          stopPolling();
+          storeRef.current.failTask(i18n.t('generate.toast.pollFailed'));
+          return;
+        }
+
+        // 优化：使用指数退避策略计算重试间隔
+        // 3s -> 6s -> 12s -> 15s (上限)
+        const backoffInterval = Math.min(
+          POLL_INTERVAL * Math.pow(2, pollRetryCountRef.current - 1),
+          MAX_BACKOFF_INTERVAL
+        );
+        basePollIntervalRef.current = backoffInterval;
+
+        console.log(`Polling failed, retrying in ${backoffInterval}ms... (${pollRetryCountRef.current}/${MAX_POLL_RETRIES})`);
+        pollTimerRef.current = setTimeout(poll, backoffInterval);
+      }
+    };
+
+    // 开始轮询
+    poll();
+  }, [stopPolling]);
+
+  // 监听 connectionMode 变化，当切换到 polling 时自动启动轮询
+  useEffect(() => {
+    if (connectionMode === 'polling' && status === 'processing' && taskId && !isBatchTaskId(taskId) && !isPollingRef.current) {
+      console.log('Detected polling mode, starting poll');
+      startPolling(taskId);
+    }
+  }, [connectionMode, status, taskId, startPolling]);
+
+  // 主动同步：当任务开始处理时启动定期检查
+  useEffect(() => {
+    if (status === 'processing' && taskId && !isBatchTaskId(taskId)) {
+      // 启动主动同步作为兜底机制
+      startActiveSync(taskId);
+    } else {
+      // 任务结束或空闲时停止主动同步
+      stopActiveSync();
+    }
+  }, [status, taskId, startActiveSync, stopActiveSync]);
+
+  // 清理定时器和状态
+  useEffect(() => {
+    return () => {
+      // 清理轮询定时器
+      if (pollTimerRef.current) {
+        clearTimeout(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+      // 清理超时定时器
+      if (timeoutTimerRef.current) {
+        clearTimeout(timeoutTimerRef.current);
+        timeoutTimerRef.current = null;
+      }
+      // 清理主动同步定时器
+      if (activeSyncTimerRef.current) {
+        clearTimeout(activeSyncTimerRef.current);
+        activeSyncTimerRef.current = null;
+      }
+      // 重置轮询状态（Bug #4修复）
+      isPollingRef.current = false;
+      // 重置重试计数器
+      pollRetryCountRef.current = 0;
+    };
+  }, []);
+
+  const generate = async () => {
+    if (!config.imageApiKey) {
+      toast.error(i18n.t('generate.toast.missingApiKey'));
+      return;
+    }
+    if (!config.prompt.trim()) {
+      toast.error(i18n.t('prompt.toast.empty'));
+      return;
+    }
+    const promptOptimizeConfigIssue = getPromptOptimizeConfigIssue({
+      mode: config.defaultPromptOptimizeMode,
+      chatProvider: config.chatProvider,
+      chatApiBaseUrl: config.chatApiBaseUrl,
+      chatApiKey: config.chatApiKey,
+      chatModel: config.chatModel,
+      chatTimeoutSeconds: config.chatTimeoutSeconds,
+      chatSyncedConfig: config.chatSyncedConfig,
+      requireSynced: true
+    });
+    if (promptOptimizeConfigIssue === 'missing') {
+      toast.error(i18n.t('prompt.toast.chatConfig'));
+      return;
+    }
+    if (promptOptimizeConfigIssue === 'unsynced') {
+      toast.error(i18n.t('prompt.toast.chatConfigChanged'));
+      return;
+    }
+    if (promptOptimizeConfigIssue === 'unsupported') {
+      toast.error(i18n.t('settings.toast.openaiGeminiUnsupported'));
+      return;
+    }
+
+    resetPromptHistory(config.prompt);
+
+    // 优化 UX：如果用户在历史页点击“开始生成”，先立刻切到生成页
+    // 避免历史页在请求期间/状态切换时出现“跳回顶部再切页”的观感
+    if (useGenerateStore.getState().currentTab !== 'generate') {
+      useGenerateStore.getState().setTab('generate');
+    }
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('template-market:close', { detail: { reason: 'generate' } }));
+    }
+
+    setSubmitting(true);
+    setIsInternalSubmitting(true);
+    try {
+      // 竞态条件修复：启动新任务前清理旧的更新源标记
+      clearUpdateSource();
+      const verboseLogging = getDiagnosticVerbose();
+
+      const requestedCount = Math.max(1, Number(config.count) || 1);
+      const promptOptimizeMode = config.defaultPromptOptimizeMode || 'off';
+      const shouldAutoOptimizePrompt = promptOptimizeMode !== 'off';
+      const useNativeSize = isUsingNativeImageSize(config.imageProvider, config.imageModel);
+      const useQuality = isQualityControlSupported(config.imageProvider);
+      const allowReferenceImages = isReferenceImageSupported(config.imageProvider);
+      const qualityParams = useQuality
+        ? {
+            quality: config.imageQuality,
+          }
+        : {};
+      const taskOptions = useNativeSize
+        ? {
+            size: config.imageNativeSize,
+            ...qualityParams,
+          }
+        : {
+            aspectRatio: config.aspectRatio,
+            imageSize: config.imageSize,
+            ...qualityParams,
+          };
+      const buildImageParams = (count: number) => ({
+        prompt: config.prompt,
+        count,
+        ...(useNativeSize ? {
+          size: config.imageNativeSize,
+        } : {
+          aspectRatio: config.aspectRatio,
+          imageSize: config.imageSize,
+        }),
+        ...qualityParams,
+        verbose_logging: verboseLogging,
+        ...(shouldAutoOptimizePrompt ? {
+          prompt_optimize_mode: promptOptimizeMode,
+          prompt_optimize_provider: config.chatProvider,
+          prompt_optimize_model: config.chatModel,
+        } : {}),
+      });
+
+      const submitSingleGenerate = async () => {
+        if (allowReferenceImages && config.refFiles.length > 0) {
+          const formData = new FormData();
+          formData.append('prompt', config.prompt);
+          formData.append('provider', config.imageProvider);
+          formData.append('model_id', config.imageModel);
+          if (useNativeSize) {
+            formData.append('size', config.imageNativeSize);
+          } else {
+            formData.append('aspectRatio', config.aspectRatio);
+            formData.append('imageSize', config.imageSize);
+          }
+          if (useQuality) {
+            formData.append('quality', config.imageQuality);
+          }
+          formData.append('count', '1');
+          formData.append('verbose_logging', String(verboseLogging));
+          if (shouldAutoOptimizePrompt) {
+            formData.append('prompt_optimize_mode', promptOptimizeMode);
+            formData.append('prompt_optimize_provider', config.chatProvider);
+            formData.append('prompt_optimize_model', config.chatModel);
+          }
+
+          config.refFiles.forEach((file) => {
+            const extFile = file as any;
+            if (extFile.__path) {
+              formData.append('refPaths', extFile.__path);
+            } else {
+              formData.append('refImages', file);
+            }
+          });
+
+          return generateBatchWithImages(formData);
+        }
+
+        return generateBatch({
+          provider: config.imageProvider,
+          model_id: config.imageModel,
+          params: buildImageParams(1)
+        } as any);
+      };
+
+      const pollTaskUntilFinished = async (singleTaskId: string) => {
+        const startTime = Date.now();
+        const timeoutMs = (config.imageTimeoutSeconds || 500) * 1000;
+        let retry = 0;
+        while (true) {
+          // 超时检测
+          if (Date.now() - startTime > timeoutMs) {
+            throw new Error(i18n.t('generate.toast.timeout', { seconds: Math.round(timeoutMs / 1000) }));
+          }
+          try {
+            const taskData = await getTaskStatus(singleTaskId);
+            retry = 0;
+            if (taskData.status === 'completed' || taskData.status === 'failed' || taskData.status === 'partial') {
+              return taskData;
+            }
+            await sleep(POLL_INTERVAL);
+          } catch (err) {
+            retry += 1;
+            if (retry >= MAX_POLL_RETRIES) {
+              throw err;
+            }
+            const backoffInterval = Math.min(
+              POLL_INTERVAL * Math.pow(2, retry - 1),
+              MAX_BACKOFF_INTERVAL
+            );
+            await sleep(backoffInterval);
+          }
+        }
+      };
+
+      if (requestedCount > 1) {
+        const batchTaskId = `${BATCH_TASK_PREFIX}${Date.now()}`;
+        startTask(batchTaskId, requestedCount, {
+          prompt: config.prompt,
+          aspectRatio: useNativeSize ? undefined : config.aspectRatio,
+          imageSize: useNativeSize ? config.imageNativeSize : config.imageSize,
+          options: taskOptions
+        });
+        setConnectionMode('none');
+        expectedTaskIdRef.current = batchTaskId;
+
+        const historyStore = useHistoryStore.getState();
+        const createResults = await Promise.allSettled(
+          Array.from({ length: requestedCount }, () => submitSingleGenerate())
+        );
+
+        const createdTasks: any[] = [];
+        let firstError = '';
+        createResults.forEach((result) => {
+          if (result.status === 'fulfilled') {
+            const task = result.value as any;
+            const createdTaskId = task?.id || task?.task_id;
+            if (createdTaskId) {
+              createdTasks.push(task);
+            } else if (!firstError) {
+              firstError = i18n.t('generate.toast.taskIdMissing');
+            }
+          } else if (!firstError) {
+            firstError = result.reason instanceof Error
+              ? result.reason.message
+              : i18n.t('generate.toast.startFailed');
+          }
+        });
+
+        createdTasks.forEach((task) => {
+          historyStore.upsertTask({
+            ...task,
+            status: 'processing',
+            updatedAt: new Date().toISOString()
+          });
+        });
+
+        if (createdTasks.length === 0) {
+          const errorMessage = firstError || i18n.t('generate.toast.startFailed');
+          toast.error(errorMessage);
+          storeRef.current.failTask(errorMessage);
+          expectedTaskIdRef.current = null;
+          clearUpdateSource();
+          return;
+        }
+
+        let successCount = 0;
+        const finalResults = await Promise.allSettled(
+          createdTasks.map(async (task) => {
+            const singleTaskId = task.id || task.task_id;
+            const finalTask = await pollTaskUntilFinished(singleTaskId);
+            historyStore.upsertTask(finalTask);
+
+            if (finalTask.images && finalTask.images.length > 0) {
+              const images = finalTask.images;
+              successCount += images.length;
+              storeRef.current.updateProgressBatch(successCount, images);
+            }
+
+            if (finalTask.status === 'failed' && finalTask.errorMessage && !firstError) {
+              firstError = finalTask.errorMessage;
+            }
+          })
+        );
+
+        finalResults.forEach((result) => {
+          if (result.status === 'rejected' && !firstError) {
+            firstError = result.reason instanceof Error
+              ? result.reason.message
+              : i18n.t('generate.toast.startFailed');
+          }
+        });
+
+        if (successCount === 0) {
+          const errorMessage = firstError || i18n.t('generate.toast.startFailed');
+          toast.error(errorMessage);
+          storeRef.current.failTask(errorMessage);
+          expectedTaskIdRef.current = null;
+          clearUpdateSource();
+          return;
+        }
+
+        if (successCount < requestedCount) {
+          toast.info(i18n.t('generate.toast.countMismatch', {
+            total: requestedCount,
+            returned: successCount
+          }));
+        }
+
+        storeRef.current.completeTask();
+        expectedTaskIdRef.current = null;
+        clearUpdateSource();
+        return;
+      }
+
+      let response;
+
+      if (allowReferenceImages && config.refFiles.length > 0) {
+        // --- 场景 A: 图生图 (multipart/form-data) ---
+        const formData = new FormData();
+        formData.append('prompt', config.prompt);
+        formData.append('provider', config.imageProvider);
+        formData.append('model_id', config.imageModel);
+        if (useNativeSize) {
+          formData.append('size', config.imageNativeSize);
+        } else {
+          formData.append('aspectRatio', config.aspectRatio);
+          formData.append('imageSize', config.imageSize);
+        }
+        if (useQuality) {
+          formData.append('quality', config.imageQuality);
+        }
+        formData.append('count', requestedCount.toString());
+        formData.append('verbose_logging', String(verboseLogging));
+        if (shouldAutoOptimizePrompt) {
+          formData.append('prompt_optimize_mode', promptOptimizeMode);
+          formData.append('prompt_optimize_provider', config.chatProvider);
+          formData.append('prompt_optimize_model', config.chatModel);
+        }
+        
+        // 添加所有参考图片
+        for (const file of config.refFiles) {
+          const extFile = file as any;
+          if (extFile.__path) {
+            const resolvedPath = await resolveRefPathForUpload(extFile.__path);
+            if (resolvedPath) {
+              // 如果有真实本地路径，直接传路径，避免大文件 IPC 传输
+              formData.append('refPaths', resolvedPath);
+              continue;
+            }
+          }
+
+          if (file.size > 0) {
+            // 否则传二进制文件 (Web 环境或拖拽上传)
+            formData.append('refImages', file);
+          } else {
+            console.warn('[useGenerate] skip ref image without valid path or file bytes');
+          }
+        }
+
+        response = await generateBatchWithImages(formData);
+      } else {
+        // --- 场景 B: 文本生图 (JSON) ---
+        response = await generateBatch({
+          provider: config.imageProvider,
+          model_id: config.imageModel,
+          params: buildImageParams(requestedCount)
+        } as any);
+      }
+
+      // 响应拦截器已返回 ApiResponse.data，并经过 mapBackendTaskToFrontend 映射
+      const task = response as any;
+      const newTaskId = task.id || task.task_id;
+
+      if (!newTaskId) {
+        throw new Error(i18n.t('generate.toast.taskIdMissing'));
+      }
+
+      console.log('[useGenerate] start generation task:', { newTaskId, count: requestedCount });
+
+      // 启动任务
+      startTask(newTaskId, requestedCount, {
+          prompt: config.prompt,
+          aspectRatio: useNativeSize ? undefined : config.aspectRatio,
+          imageSize: useNativeSize ? config.imageNativeSize : config.imageSize,
+          options: taskOptions
+      });
+
+      // 生成区与历史区同步：先写入一条本地任务占位，避免历史列表不刷新导致状态不同步
+      useHistoryStore.getState().upsertTask({
+        ...task,
+        status: 'processing',
+        updatedAt: new Date().toISOString()
+      });
+
+      // 记录当前任务ID，供超时回调验证
+      expectedTaskIdRef.current = newTaskId;
+
+      // 保留参考图，让用户手动清空
+
+      // 启动流式连接超时检测（若未建立连接，切换到轮询）
+      timeoutTimerRef.current = setTimeout(() => {
+        // 检查最新状态和任务ID是否匹配（防止闭包陷阱）
+        const currentState = useGenerateStore.getState();
+        if (
+          currentState.status === 'processing' &&
+          currentState.connectionMode === 'websocket' &&
+          currentState.taskId === expectedTaskIdRef.current && // 验证任务ID
+          getUpdateSource() !== 'websocket' // 仍未建立流式连接
+        ) {
+          console.log('Stream open timeout, switching to polling mode');
+          setConnectionMode('polling');
+          // 不需要手动调用 startPolling，useEffect 会自动检测并启动
+        }
+      }, STREAM_OPEN_TIMEOUT);
+
+    } catch (error) {
+      console.error('Failed to start generation:', error);
+      const errorMessage = error instanceof Error ? error.message : i18n.t('generate.toast.startFailed');
+      toast.error(errorMessage);
+      failTask(errorMessage);
+      expectedTaskIdRef.current = null; // 清理任务ID
+      // 竞态条件修复：失败时清理更新源标记
+      clearUpdateSource();
+    } finally {
+      setSubmitting(false);
+      setIsInternalSubmitting(false);
+    }
+  };
+
+  return {
+    generate,
+    isProcessing: status === 'processing' || isSubmitting
+  };
+}

@@ -1,0 +1,145 @@
+package diagnostic
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"log"
+	"regexp"
+	"strings"
+)
+
+var sensitiveValuePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)("api[_-]?key"\s*:\s*")([^"]+)(")`),
+	regexp.MustCompile(`(?i)("authorization"\s*:\s*")([^"]+)(")`),
+	regexp.MustCompile(`(?i)(\bapi[_-]?key\s*=\s*"?)([^"\s,}]+)("?)`),
+	regexp.MustCompile(`(?i)(\bauthorization\s*=\s*"?)([^"\s,}]+)("?)`),
+	regexp.MustCompile(`(?i)([?&]key=)([^&\s]+)`),
+	regexp.MustCompile(`(?i)(bearer\s+)([A-Za-z0-9._\-]+)`),
+}
+
+func VerboseEnabled(params map[string]interface{}) bool {
+	if params == nil {
+		return false
+	}
+	for _, key := range []string{"_verbose_logging", "verbose_logging"} {
+		if value, ok := params[key]; ok && toBool(value) {
+			return true
+		}
+	}
+	return false
+}
+
+func AttachVerboseFlag(params map[string]interface{}, enabled bool) {
+	if params == nil {
+		return
+	}
+	if enabled {
+		params["_verbose_logging"] = true
+	} else {
+		delete(params, "_verbose_logging")
+	}
+}
+
+func TaskID(params map[string]interface{}) string {
+	if params == nil {
+		return ""
+	}
+	for _, key := range []string{"_task_id", "task_id"} {
+		if value, ok := params[key].(string); ok {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func AttachTaskID(params map[string]interface{}, taskID string) {
+	if params == nil || strings.TrimSpace(taskID) == "" {
+		return
+	}
+	params["_task_id"] = strings.TrimSpace(taskID)
+}
+
+func Logf(params map[string]interface{}, stage string, format string, args ...interface{}) {
+	if !VerboseEnabled(params) {
+		return
+	}
+	taskID := TaskID(params)
+	prefix := "[Diag]"
+	if taskID != "" {
+		prefix = fmt.Sprintf("[Diag][task_id=%s]", taskID)
+	}
+	if stage != "" {
+		prefix = fmt.Sprintf("%s[%s]", prefix, stage)
+	}
+	log.Printf("%s %s", prefix, fmt.Sprintf(format, args...))
+}
+
+func PromptHash(prompt string) string {
+	sum := sha256.Sum256([]byte(prompt))
+	return hex.EncodeToString(sum[:8])
+}
+
+func Preview(text string, maxRunes int) string {
+	trimmed := strings.TrimSpace(text)
+	if maxRunes <= 0 || trimmed == "" {
+		return trimmed
+	}
+	runes := []rune(trimmed)
+	if len(runes) <= maxRunes {
+		return trimmed
+	}
+	return string(runes[:maxRunes]) + "...(truncated)"
+}
+
+type ResponseSummary struct {
+	Length  int
+	Preview string
+}
+
+func ResponseBodySummary(body []byte, maxPreviewRunes int) ResponseSummary {
+	return ResponseSummary{
+		Length:  len(body),
+		Preview: Preview(RedactSensitive(string(body)), maxPreviewRunes),
+	}
+}
+
+func ResponseBodyErrorPreview(body []byte, maxPreviewRunes int) string {
+	summary := ResponseBodySummary(body, maxPreviewRunes)
+	return fmt.Sprintf("body_length=%d body_preview=%s", summary.Length, summary.Preview)
+}
+
+func RedactSensitive(text string) string {
+	redacted := text
+	for _, pattern := range sensitiveValuePatterns {
+		redacted = pattern.ReplaceAllString(redacted, "${1}***REDACTED***${3}")
+	}
+	return redacted
+}
+
+func ExtractRequestID(text string) string {
+	matches := requestIDPattern.FindStringSubmatch(text)
+	if len(matches) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(matches[1])
+}
+
+func toBool(value interface{}) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			return true
+		}
+	case int:
+		return v != 0
+	case int64:
+		return v != 0
+	case float64:
+		return v != 0
+	}
+	return false
+}

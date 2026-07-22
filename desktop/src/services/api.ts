@@ -1,0 +1,415 @@
+import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
+import { ApiResponse } from '../types';
+import { getDiagnosticVerbose } from '../utils/diagnosticLogger';
+
+export interface ApiRequestConfig extends AxiosRequestConfig {
+  __returnResponse?: boolean;
+  __skipPortDetection?: boolean;
+}
+
+export interface ImageSource {
+  kind?: 'http_url' | 'storage_relative' | string;
+  value?: string;
+}
+
+const isWindowsAbsolutePath = (p: string) => /^[a-zA-Z]:[\\/]/.test(p) || p.startsWith('\\\\');
+const normalizeSlashes = (p: string) => p.replace(/\\/g, '/');
+const isStorageRelativePath = (p: string) => {
+  const normalized = normalizeSlashes(p);
+  return normalized.startsWith('/storage/') || normalized.startsWith('storage/');
+};
+const isPosixAbsolutePath = (p: string) => p.startsWith('/') && !isStorageRelativePath(p);
+const looksLikeAbsolutePath = (p: string) => isPosixAbsolutePath(p) || isWindowsAbsolutePath(p);
+
+const logImageUrlDiagnostic = (...args: unknown[]) => {
+  if (getDiagnosticVerbose()) {
+    console.log(...args);
+  }
+};
+
+const normalizeAssetAbsolutePath = (rawPath: string) => {
+  let normalized = normalizeSlashes(rawPath);
+
+  // 保留 Windows UNC 前缀，避免 //server/share 被压成 /server/share
+  if (normalized.startsWith('//')) {
+    const uncBody = normalized.slice(2).replace(/\/+/g, '/');
+    return `//${uncBody}`;
+  }
+
+  // Windows 盘符路径保持 C:/... 形式，不补前导 /
+  if (isWindowsAbsolutePath(normalized)) {
+    return normalized.replace(/\/+/g, '/');
+  }
+
+  normalized = normalized.replace(/\/+/g, '/');
+  if (!looksLikeAbsolutePath(normalized)) {
+    normalized = `/${normalized}`;
+  }
+  return normalized;
+};
+
+const parseFileUrlPath = (input: string) => {
+  if (!input.startsWith('file://')) return null;
+
+  try {
+    const parsed = new URL(input);
+    const host = parsed.hostname || '';
+    let decodedPath = decodeURIComponent(parsed.pathname || '');
+
+    // file:///C:/... 在 URL.pathname 中会变成 /C:/...，需要还原成 C:/...
+    if (/^\/[a-zA-Z]:\//.test(decodedPath)) {
+      decodedPath = decodedPath.slice(1);
+    }
+
+    if (host && host.toLowerCase() !== 'localhost') {
+      return `//${host}${decodedPath}`;
+    }
+    return decodedPath;
+  } catch {
+    try {
+      const withoutScheme = input.replace(/^file:\/\//, '');
+      const withoutHost = withoutScheme.replace(/^localhost\//i, '');
+      return decodeURIComponent(withoutHost);
+    } catch {
+      return null;
+    }
+  }
+};
+
+// 根据 API 文档，后端地址默认为 http://127.0.0.1:8080
+export let BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8080/api/v1';
+
+// 创建 axios 实例
+const api = axios.create({
+  baseURL: BASE_URL,
+  timeout: 60000,
+}) as AxiosInstance;
+
+// 标记是否已经获取到了动态端口
+let isPortDetected = false;
+let portDetectedResolve: (() => void) | null = null;
+const portDetectedPromise = new Promise<void>((resolve) => {
+  portDetectedResolve = resolve;
+});
+let tauriInvoke: ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null = null;
+// 应用数据目录，用于拼接本地图片路径
+let appDataDir: string | null = null;
+let resolveInit: (value: void | PromiseLike<void>) => void;
+export const tauriInitPromise = new Promise<void>((resolve) => {
+  resolveInit = resolve;
+});
+
+// 如果在 Tauri 环境中，主动获取端口并监听更新
+if (window.__TAURI_INTERNALS__) {
+  const initTauri = async () => {
+    try {
+      const { invoke, convertFileSrc } = await import('@tauri-apps/api/core');
+      const { listen } = await import('@tauri-apps/api/event');
+
+      // 将 convertFileSrc 挂载到 window 方便全局使用
+      (window as any).convertFileSrc = convertFileSrc;
+      tauriInvoke = invoke;
+
+      // 1. 先尝试获取当前已记录的端口
+      const port = await invoke<number>('get_backend_port');
+      if (port && port > 0) {
+        updateBaseUrl(port);
+      }
+
+      // 2. 获取应用数据目录
+      appDataDir = await invoke<string>('get_app_data_dir');
+      console.log('App Data Dir detected:', appDataDir);
+
+      // 初始化完成
+      resolveInit();
+
+      // 3. 监听后续端口更新事件
+      listen<{ port: number }>('backend-port', (event) => {
+        updateBaseUrl(event.payload.port);
+      });
+    } catch (err) {
+      console.error('Failed to initialize Tauri API:', err);
+      resolveInit();
+    }
+  };
+
+  initTauri();
+} else {
+  // 非 Tauri 环境立即完成
+  setTimeout(() => resolveInit?.(), 0);
+}
+
+function updateBaseUrl(port: number) {
+  console.log('Updating backend port to:', port);
+  const newBaseUrl = `http://127.0.0.1:${port}/api/v1`;
+  BASE_URL = newBaseUrl;
+  api.defaults.baseURL = newBaseUrl;
+  isPortDetected = true;
+  if (portDetectedResolve) {
+    portDetectedResolve();
+    portDetectedResolve = null;
+  }
+  console.log('API base URL updated to:', newBaseUrl);
+}
+
+export function forceUpdateBackendPort(port: number) {
+  if (typeof port === 'number' && port > 0) {
+    updateBaseUrl(port);
+  }
+}
+
+async function waitForBackendPort(timeoutMs = 10000) {
+  if (!window.__TAURI_INTERNALS__) return;
+
+  await tauriInitPromise;
+  if (isPortDetected) return;
+
+  if (!tauriInvoke) {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      tauriInvoke = invoke;
+    } catch (err) {
+      console.warn('Failed to load Tauri invoke API:', err);
+    }
+  }
+
+  const start = Date.now();
+  while (!isPortDetected && Date.now() - start < timeoutMs) {
+    if (tauriInvoke) {
+      try {
+        const port = await tauriInvoke('get_backend_port');
+        if (typeof port === 'number' && port > 0) {
+          updateBaseUrl(port);
+          break;
+        }
+      } catch (err) {
+        console.warn('Failed to fetch backend port:', err);
+      }
+    }
+
+    await Promise.race([
+      portDetectedPromise,
+      new Promise((resolve) => setTimeout(resolve, 200)),
+    ]);
+  }
+
+  if (!isPortDetected) {
+    console.warn('Backend port not detected within timeout, continuing with default base URL.');
+  }
+}
+
+// Tauri 场景下确保 BASE_URL 已更新为动态端口
+export async function ensureBackendReady(timeoutMs = 10000) {
+  if (window.__TAURI_INTERNALS__) {
+    await waitForBackendPort(timeoutMs);
+  }
+}
+
+export async function getBackendPort(): Promise<number> {
+  if (!window.__TAURI_INTERNALS__) {
+    const match = BASE_URL.match(/127\.0\.0\.1:(\d+)/);
+    return match ? Number(match[1]) : 0;
+  }
+  await tauriInitPromise;
+  if (!tauriInvoke) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    tauriInvoke = invoke;
+  }
+  const port = await tauriInvoke('get_backend_port');
+  return typeof port === 'number' ? port : 0;
+}
+
+export async function isSidecarRunning(): Promise<boolean> {
+  if (!window.__TAURI_INTERNALS__) return true;
+  await tauriInitPromise;
+  if (!tauriInvoke) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    tauriInvoke = invoke;
+  }
+  const result = await tauriInvoke('is_sidecar_running');
+  return Boolean(result);
+}
+
+export async function restartSidecar(): Promise<void> {
+  if (!window.__TAURI_INTERNALS__) return;
+  await tauriInitPromise;
+  if (!tauriInvoke) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    tauriInvoke = invoke;
+  }
+  await tauriInvoke('restart_sidecar');
+}
+
+// 请求拦截器
+api.interceptors.request.use(async (config) => {
+  const requestConfig = config as ApiRequestConfig;
+  if (window.__TAURI_INTERNALS__ && !isPortDetected && !requestConfig.__skipPortDetection) {
+    await waitForBackendPort();
+  }
+
+  // 确保 config.baseURL 使用最新的 BASE_URL（如果还没设置的话）
+  if (isPortDetected && config.baseURL !== BASE_URL) {
+    config.baseURL = BASE_URL;
+  }
+
+  console.log(`Making request to: ${config.baseURL}${config.url}`);
+  return config;
+});
+
+// 响应拦截器
+api.interceptors.response.use(
+  (response) => {
+    // 特殊响应（如 responseType: 'blob'）不走统一 ApiResponse 解包
+    const data = response.data as unknown;
+    if (data instanceof Blob) {
+      const config = response.config as ApiRequestConfig;
+      if (config.__returnResponse) return response;
+      return data;
+    }
+
+    // 统一 JSON 响应格式解包：{ code, message, data }
+    if (data && typeof data === 'object' && 'code' in data) {
+      const res = data as ApiResponse<any>;
+      // 支持 0 或 200 作为成功码
+      if (typeof res.code === 'number' && res.code !== 0 && res.code !== 200) {
+        return Promise.reject(new Error(res.message || 'Error'));
+      }
+      return res.data;
+    }
+
+    // 非统一结构（或后端直出数据），原样返回
+    return data;
+  },
+  async (error) => {
+    console.error('API Error Object:', error);
+    
+    if (error.message === 'Network Error' || error.code === 'ERR_NETWORK') {
+      console.error('Detected Network Error. Diagnostics:');
+      console.error('- BaseURL:', api.defaults.baseURL);
+      console.error('- IsPortDetected:', isPortDetected);
+      
+      // 尝试 ping 一下健康检查接口
+      try {
+        const pingUrl = `${api.defaults.baseURL}/health`;
+        console.log('Attempting diagnostic ping to:', pingUrl);
+        // 使用 fetch 并增加一些配置，尝试穿透可能的拦截
+        const response = await fetch(pingUrl, { 
+          mode: 'cors',
+          cache: 'no-cache',
+          headers: { 'Accept': 'application/json' }
+        });
+        const result = await response.json();
+        console.log('Diagnostic ping (fetch) succeeded:', result);
+        console.log('This suggests the server is UP and CORS is OK. The issue might be Axios-specific or a race condition.');
+      } catch (pingErr) {
+        console.error('Diagnostic ping (fetch) failed:', pingErr);
+        console.error('This suggests the server is NOT reachable. Possible reasons: Sandbox blocking, Process not running, or wrong IP/Port.');
+      }
+    }
+
+    return Promise.reject(error);
+  }
+);
+
+// 构造图片完整 URL 的工具函数
+export const getImageUrl = (path: string) => {
+  if (!path) return '';
+
+  const trimmed = path.trim();
+  if (!trimmed) return '';
+
+  // 已经是可直接加载的 URL，直接返回
+  if (
+    trimmed.startsWith('http://') ||
+    trimmed.startsWith('https://') ||
+    trimmed.startsWith('blob:') ||
+    trimmed.startsWith('data:') ||
+    trimmed.startsWith('asset:') ||
+    trimmed.startsWith('tauri:') ||
+    trimmed.startsWith('ipc:') ||
+    trimmed.startsWith('http://asset.localhost')
+  ) {
+    return trimmed;
+  }
+
+  // file:// URL 在 WebView 中通常不可直接访问；在 Tauri 环境下尽量转换成 asset 协议
+  const fileUrlPath = parseFileUrlPath(trimmed);
+  
+  // 如果在 Tauri 环境下，且我们有 appDataDir，且路径看起来是本地存储路径
+  // 优先使用 asset:// 协议直接读取本地磁盘，绕过 HTTP 端口，提升性能
+  const tauriInternals = (window as any).__TAURI_INTERNALS__ as
+    | { convertFileSrc?: (filePath: string, protocol?: string) => string }
+    | undefined;
+
+  const convertFileSrcSync: ((filePath: string) => string) | null = (() => {
+    const globalConvert = (window as any).convertFileSrc;
+    if (typeof globalConvert === 'function') return (filePath: string) => globalConvert(filePath);
+    if (tauriInternals?.convertFileSrc) return (filePath: string) => tauriInternals.convertFileSrc!(filePath, 'asset');
+    return null;
+  })();
+
+  const canUseAssetProtocol = Boolean(tauriInternals && convertFileSrcSync);
+
+  // 1) 直接是文件路径（绝对路径或 file://）时，优先走 asset 协议
+  if (canUseAssetProtocol && (fileUrlPath || looksLikeAbsolutePath(trimmed))) {
+    try {
+      const absolutePath = normalizeAssetAbsolutePath(fileUrlPath || trimmed);
+      const url = convertFileSrcSync!(absolutePath);
+      logImageUrlDiagnostic('[getImageUrl] Converted absolute path to asset URL:', url, 'from:', absolutePath);
+      return url;
+    } catch (err) {
+      console.error('[getImageUrl] Failed to convert absolute path to asset URL:', err);
+    }
+  }
+
+  // 2) 典型的本地存储相对路径：尽量在 appDataDir 已获取后走 asset 协议
+  if (canUseAssetProtocol && appDataDir && isStorageRelativePath(trimmed)) {
+    try {
+      // 这里的 path 可能是 storage/local/xxx.jpg
+      // 我们需要拼接成绝对路径：appDataDir + / + path
+      const separator = appDataDir.endsWith('/') || appDataDir.endsWith('\\') ? '' : '/';
+      // 如果 path 已经包含 appDataDir (可能是绝对路径)，则不重复拼接
+      const storagePath = normalizeSlashes(trimmed).replace(/^\/+/, '');
+      const absolutePath = normalizeAssetAbsolutePath(
+        trimmed.includes(appDataDir) ? trimmed : `${appDataDir}${separator}${storagePath}`
+      );
+
+      // 使用 Tauri 提供的 convertFileSrc 将绝对路径转为 asset:// 协议 URL
+      const url = convertFileSrcSync!(absolutePath);
+      logImageUrlDiagnostic('[getImageUrl] Converted to asset URL:', url, 'from:', absolutePath);
+      return url;
+    } catch (err) {
+      console.error('[getImageUrl] Failed to convert local path to asset URL:', err);
+    }
+  }
+
+  // 回退到 HTTP 方案
+  // 从 BASE_URL 中提取基础地址（去掉 /api/v1）
+  const baseUrl = api.defaults.baseURL || BASE_URL;
+  const baseHost = baseUrl.replace('/api/v1', '');
+  // 确保路径以 / 开头
+  const normalizedInputPath = trimmed.replace(/\\/g, '/');
+  const normalizedPath = normalizedInputPath.startsWith('/') ? normalizedInputPath : `/${normalizedInputPath}`;
+  
+  const url = `${baseHost}${normalizedPath}`;
+  logImageUrlDiagnostic('[getImageUrl] HTTP Fallback URL:', url);
+  return url;
+};
+
+export const getImageUrlFromSource = (source?: ImageSource | null, fallbackPath: string = '') => {
+  if (!source?.value) return getImageUrl(fallbackPath);
+  const kind = (source.kind || '').trim();
+  const value = source.value.trim();
+  if (!value) return getImageUrl(fallbackPath);
+  if (kind && kind !== 'http_url' && kind !== 'storage_relative') {
+    return getImageUrl(fallbackPath);
+  }
+  return getImageUrl(value);
+};
+
+// 获取图片下载 URL
+export const getImageDownloadUrl = (id: string) => {
+    return `${BASE_URL}/images/${id}/download`;
+};
+
+export default api;

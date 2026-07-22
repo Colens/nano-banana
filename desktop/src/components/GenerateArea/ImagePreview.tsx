@@ -1,0 +1,1233 @@
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { Modal } from '../common/Modal';
+import { GeneratedImage } from '../../types';
+import { Button } from '../common/Button';
+import { Download, Copy, Calendar, Box, Maximize2, X, ZoomIn, ZoomOut, ChevronLeft, ChevronRight, Trash2, Check, ImageOff } from 'lucide-react';
+import { formatDateTime } from '../../utils/date';
+import { BASE_URL, ensureBackendReady, getImageDownloadUrl, getImageUrl } from '../../services/api';
+import { useHistoryStore } from '../../store/historyStore';
+import { toast } from '../../store/toastStore';
+import { useTranslation } from 'react-i18next';
+import { localizeErrorSummary } from '../../utils/errorI18n';
+
+interface ImagePreviewProps {
+    image: (GeneratedImage & { model?: string }) | null;
+    images?: GeneratedImage[]; // 传入图片列表用于切换
+    onImageChange?: (image: GeneratedImage) => void; // 切换时的回调
+    onDeleteSuccess?: (image: GeneratedImage) => void;
+    sourceContext?: 'generate' | 'history';
+    onClose: () => void;
+}
+
+// 使用 React.memo 优化，只有在关键 props 变化时才重新渲染
+export const ImagePreview = React.memo(function ImagePreview({
+    image,
+    images = [],
+    onImageChange,
+    onDeleteSuccess,
+    sourceContext = 'generate',
+    onClose
+}: ImagePreviewProps) {
+    const { t, i18n } = useTranslation();
+
+    // 判断是否为失败图片
+    const isFailedImage = useMemo(() => !image?.url && !image?.thumbnailUrl && image?.status === 'failed', [image]);
+    const [scale, setScale] = useState(1);
+    const [position, setPosition] = useState({ x: 0, y: 0 });
+    const [isDragging, setIsDragging] = useState(false);
+    const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+    const [isDeleting, setIsDeleting] = useState(false);
+    const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+    const [copiedPromptKey, setCopiedPromptKey] = useState<'single' | 'original' | 'optimized' | null>(null);
+    const [isCopyingImage, setIsCopyingImage] = useState(false);
+    const [fullImageLoaded, setFullImageLoaded] = useState(false);
+    const [fullImageError, setFullImageError] = useState(false);
+    const [isWheelZooming, setIsWheelZooming] = useState(false);
+    const [contextMenu, setContextMenu] = useState<{ x: number; y: number; adjusted: boolean } | null>(null);
+    const [showOriginalPrompt, setShowOriginalPrompt] = useState(false);
+    const [showOptimizedPrompt, setShowOptimizedPrompt] = useState(true);
+    const containerRef = useRef<HTMLDivElement>(null);
+    const deleteConfirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const copySuccessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const wheelZoomTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const imageRef = useRef<HTMLImageElement>(null);
+    const hasNotifiedCopyRef = useRef(false); // 标记是否已提示过复制
+    const contextMenuRef = useRef<HTMLDivElement>(null);
+
+    const previewableImages = useMemo(
+        () => images.filter((img) => Boolean(img.url || img.thumbnailUrl)),
+        [images]
+    );
+    const localizedError = useMemo(
+        () => (image ? localizeErrorSummary(image) : null),
+        [image, i18n.resolvedLanguage]
+    );
+    const resolvedFullImageSrc = image
+        ? getImageUrl(image.filePath || image.url || image.thumbnailPath || image.thumbnailUrl || '')
+        : '';
+    const resolvedThumbnailSrc = image
+        ? getImageUrl(image.thumbnailPath || image.filePath || image.thumbnailUrl || image.url || '')
+        : '';
+    const failedDetails = useMemo(() => {
+        if (!isFailedImage || !image) return [];
+        const details: Array<{ label: string; value: string }> = [];
+        if (localizedError?.errorCode) details.push({ label: t('preview.failed.errorCode'), value: localizedError.errorCode });
+        if (localizedError?.errorCategory) details.push({ label: t('preview.failed.errorCategory'), value: localizedError.errorCategory });
+        if (localizedError?.errorRequestId) details.push({ label: t('preview.failed.requestId'), value: localizedError.errorRequestId });
+        if (typeof localizedError?.errorRetryable === 'boolean') details.push({ label: t('preview.failed.retryable'), value: localizedError.errorRetryable ? t('common.yes') : t('common.no') });
+        if (image.model) details.push({ label: t('preview.failed.model'), value: image.model });
+        if (image.taskId) details.push({ label: t('preview.failed.taskId'), value: image.taskId });
+        return details;
+    }, [image, isFailedImage, localizedError, t]);
+
+    const failedCopyText = useMemo(() => {
+        if (!isFailedImage || !image) return '';
+        const lines: string[] = [];
+        if (localizedError?.errorMessage) lines.push(`${t('preview.failed.summary')}: ${localizedError.errorMessage}`);
+        if (localizedError?.errorCode) lines.push(`${t('preview.failed.errorCode')}: ${localizedError.errorCode}`);
+        if (localizedError?.errorCategory) lines.push(`${t('preview.failed.errorCategory')}: ${localizedError.errorCategory}`);
+        if (localizedError?.errorRequestId) lines.push(`${t('preview.failed.requestId')}: ${localizedError.errorRequestId}`);
+        if (typeof localizedError?.errorRetryable === 'boolean') lines.push(`${t('preview.failed.retryable')}: ${localizedError.errorRetryable ? t('common.yes') : t('common.no')}`);
+        if (localizedError?.errorDetail) lines.push(`${t('preview.failed.errorDetail')}: ${localizedError.errorDetail}`);
+        if (localizedError?.errorRawMessage) lines.push(`${t('preview.failed.rawError')}: ${localizedError.errorRawMessage}`);
+        if (image.promptOptimized) lines.push(`${t('preview.prompt.optimizedLabel')}: ${image.promptOptimized}`);
+        if (image.promptOriginal && image.promptOriginal !== image.promptOptimized) lines.push(`${t('preview.prompt.originalLabel')}: ${image.promptOriginal}`);
+        if (image.taskId) lines.push(`${t('preview.failed.taskId')}: ${image.taskId}`);
+        if (image.model) lines.push(`${t('preview.failed.model')}: ${image.model}`);
+        if (image.prompt) lines.push(`${t('preview.prompt.label')}: ${image.prompt}`);
+        return lines.join('\n');
+    }, [image, isFailedImage, localizedError, t]);
+
+    const hasOptimizedPromptPair = useMemo(() => {
+        const original = image?.promptOriginal?.trim() || '';
+        const optimized = image?.promptOptimized?.trim() || '';
+        return Boolean(original && optimized && original !== optimized);
+    }, [image?.promptOriginal, image?.promptOptimized]);
+
+    const singlePromptText = useMemo(() => image?.prompt || '', [image?.prompt]);
+    const optimizedPromptText = useMemo(() => image?.promptOptimized || image?.prompt || '', [image?.promptOptimized, image?.prompt]);
+    const originalPromptText = useMemo(() => image?.promptOriginal || '', [image?.promptOriginal]);
+
+    const displayPosition = useMemo(() => {
+        if (isDragging || isWheelZooming) return position;
+        return { x: Math.round(position.x), y: Math.round(position.y) };
+    }, [position, isDragging, isWheelZooming]);
+
+    // 计算当前索引（只在可预览图片中切换）
+    const currentIndex = image ? previewableImages.findIndex(img => img.id === image.id) : -1;
+    const hasPrev = currentIndex > 0;
+    const hasNext = currentIndex >= 0 && currentIndex < previewableImages.length - 1;
+
+    // 重置缩放
+    const handleReset = useCallback(() => {
+        setScale(1);
+        setPosition({ x: 0, y: 0 });
+    }, []);
+
+    // 处理图片切换
+    const goToPrev = useCallback(() => {
+        if (hasPrev && onImageChange) {
+            onImageChange(previewableImages[currentIndex - 1]);
+            handleReset();
+        }
+    }, [hasPrev, currentIndex, previewableImages, onImageChange, handleReset]);
+
+    const goToNext = useCallback(() => {
+        if (hasNext && onImageChange) {
+            onImageChange(previewableImages[currentIndex + 1]);
+            handleReset();
+        }
+    }, [hasNext, currentIndex, previewableImages, onImageChange, handleReset]);
+
+    // 关闭弹窗（用 useCallback 保持引用稳定）
+    const handleClose = useCallback(() => {
+        onClose();
+    }, [onClose]);
+
+    // image 变化时确保重置加载状态（兼容外部直接切换 image 对象）
+    useEffect(() => {
+        setFullImageLoaded(false);
+        setFullImageError(false);
+        setContextMenu(null);
+        setScale(1);
+        setPosition({ x: 0, y: 0 });
+        setCopiedPromptKey(null);
+        setShowOriginalPrompt(false);
+        setShowOptimizedPrompt(true);
+    }, [image?.id]);
+
+    useEffect(() => {
+        if (isDragging || isWheelZooming) return;
+        const nextX = Math.round(position.x);
+        const nextY = Math.round(position.y);
+        if (nextX === position.x && nextY === position.y) return;
+        setPosition({ x: nextX, y: nextY });
+    }, [position, isDragging, isWheelZooming]);
+
+    // 键盘监听 - 优化性能
+    useEffect(() => {
+        // 仅在弹窗打开时监听键盘，避免背景组件也响应方向键导致“叠一层弹窗”
+        if (!image) return;
+
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if (e.key === 'ArrowLeft') goToPrev();
+            if (e.key === 'ArrowRight') goToNext();
+            if (e.key === 'Escape') handleClose();
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [image, goToPrev, goToNext, handleClose]);
+
+    // 监听图片复制事件（image 变化时重新绑定，避免首次挂载 imageRef 为空导致不生效）
+    useEffect(() => {
+        const img = imageRef.current;
+        if (!img) return;
+
+        const handleCopy = (e: ClipboardEvent) => {
+            const items = e.clipboardData?.items;
+            if (!items) return;
+
+            const hasImage = Array.from(items).some((it) => it.type.startsWith('image/'));
+            if (hasImage && !hasNotifiedCopyRef.current) {
+                hasNotifiedCopyRef.current = true;
+                toast.success(t('toast.copyImageSuccess'));
+
+                setTimeout(() => {
+                    hasNotifiedCopyRef.current = false;
+                }, 2000);
+            }
+        };
+
+        img.addEventListener('copy', handleCopy, { capture: true });
+        return () => img.removeEventListener('copy', handleCopy, { capture: true });
+    }, [image?.id]);
+
+    // 清理定时器
+    useEffect(() => {
+        return () => {
+            if (deleteConfirmTimerRef.current) {
+                clearTimeout(deleteConfirmTimerRef.current);
+                deleteConfirmTimerRef.current = null;
+            }
+            if (copySuccessTimerRef.current) {
+                clearTimeout(copySuccessTimerRef.current);
+                copySuccessTimerRef.current = null;
+            }
+            if (wheelZoomTimerRef.current) {
+                clearTimeout(wheelZoomTimerRef.current);
+                wheelZoomTimerRef.current = null;
+            }
+        };
+    }, []);
+
+    // 处理删除图片
+    const handleDelete = useCallback(async () => {
+        if (!image) return;
+
+        if (showDeleteConfirm) {
+            // 确认删除
+            setIsDeleting(true);
+            try {
+                const nextImage =
+                    currentIndex >= 0
+                        ? (previewableImages[currentIndex + 1] || previewableImages[currentIndex - 1])
+                        : previewableImages[0];
+
+                // 使用 store 中的统一删除入口（先本地移除，再刷新）
+                await useHistoryStore.getState().deleteImage(image, {
+                    source: sourceContext === 'history' ? 'history' : 'preview'
+                });
+                onDeleteSuccess?.(image);
+
+                if (nextImage) {
+                    onImageChange?.(nextImage);
+                    handleReset();
+                } else {
+                    onClose();
+                }
+            } catch (error) {
+                console.error('Delete image failed:', error);
+                const errorMessage = error instanceof Error ? error.message : t('toast.deleteFailed');
+                toast.error(errorMessage);
+                // 删除失败时保持确认状态，允许用户重试
+                setIsDeleting(false);
+                // 不重置 showDeleteConfirm
+                return;
+            }
+            // 成功后重置状态
+            setIsDeleting(false);
+            setShowDeleteConfirm(false);
+        } else {
+            // 显示确认状态
+            setShowDeleteConfirm(true);
+            // 清除之前的定时器（如果存在）
+            if (deleteConfirmTimerRef.current) {
+                clearTimeout(deleteConfirmTimerRef.current);
+            }
+            // 3秒后自动取消
+            deleteConfirmTimerRef.current = setTimeout(() => setShowDeleteConfirm(false), 3000);
+        }
+    }, [image, showDeleteConfirm, onClose, currentIndex, previewableImages, onImageChange, onDeleteSuccess, handleReset, sourceContext]);
+
+    // 取消删除确认
+    const handleCancelDelete = useCallback(() => {
+        setShowDeleteConfirm(false);
+    }, []);
+
+    const resolveLocalImagePath = useCallback(async (rawCandidates: string[]) => {
+        const isProtocolPath = (value: string) => /^(https?:|asset:|tauri:|ipc:|blob:|data:)/i.test(value);
+        const isWindowsAbsolute = (value: string) => /^[a-zA-Z]:[\\/]/.test(value) || value.startsWith('\\\\');
+        const isStorageRelative = (value: string) => {
+            const normalized = value.replace(/\\/g, '/');
+            return normalized.startsWith('/storage/') || normalized.startsWith('storage/');
+        };
+
+        let appDataDir = '';
+        if (typeof window !== 'undefined' && (window as any).__TAURI_INTERNALS__) {
+            try {
+                const { invoke } = await import('@tauri-apps/api/core');
+                appDataDir = await invoke<string>('get_app_data_dir');
+            } catch (err) {
+                console.warn('[resolveLocalImagePath] get_app_data_dir failed:', err);
+            }
+        }
+
+        for (const raw of rawCandidates) {
+            if (!raw || typeof raw !== 'string') continue;
+            let path = raw.trim();
+            if (!path || isProtocolPath(path)) continue;
+
+            if (path.startsWith('file://')) {
+                try {
+                    const url = new URL(path);
+                    let pathname = decodeURIComponent(url.pathname || '');
+                    if (/^\/[a-zA-Z]:\//.test(pathname)) pathname = pathname.slice(1);
+                    path = url.hostname && url.hostname.toLowerCase() !== 'localhost'
+                        ? `//${url.hostname}${pathname}`
+                        : pathname;
+                } catch {
+                    try {
+                        path = decodeURIComponent(path.replace(/^file:\/\/localhost/i, '').replace(/^file:\/\//i, ''));
+                    } catch {}
+                }
+            }
+
+            const normalized = path.replace(/\\/g, '/');
+
+            if (isStorageRelative(normalized)) {
+                if (!appDataDir) continue;
+                const base = appDataDir.replace(/[\\/]+$/, '');
+                const relative = normalized.replace(/^\/+/, '');
+                return `${base}/${relative}`;
+            }
+
+            if (isWindowsAbsolute(path) || normalized.startsWith('/')) {
+                return path;
+            }
+
+            if (appDataDir) {
+                const base = appDataDir.replace(/[\\/]+$/, '');
+                const relative = normalized.replace(/^\/+/, '');
+                return `${base}/${relative}`;
+            }
+
+            return path;
+        }
+
+        return '';
+    }, []);
+
+    // 处理复制图片
+    const handleCopyImage = useCallback(async () => {
+        if (!image) return;
+        if (isCopyingImage) return;
+
+        try {
+            setIsCopyingImage(true);
+
+            const isTauri = typeof window !== 'undefined' && Boolean((window as any).__TAURI_INTERNALS__);
+
+            const guessMime = (pathOrUrl: string) => {
+                const lower = pathOrUrl.toLowerCase();
+                if (lower.endsWith('.png')) return 'image/png';
+                if (lower.endsWith('.webp')) return 'image/webp';
+                if (lower.endsWith('.gif')) return 'image/gif';
+                return 'image/jpeg';
+            };
+
+            const getBestSrc = () => resolvedFullImageSrc || resolvedThumbnailSrc || '';
+
+            // Tauri 打包环境下，Web Clipboard API 可能不可用/不稳定：优先走原生剪贴板写入
+            if (isTauri) {
+                try {
+                    const { invoke } = await import('@tauri-apps/api/core');
+                    const localPath = await resolveLocalImagePath([image.filePath, image.thumbnailPath]);
+                    if (localPath) {
+                        await invoke('copy_image_to_clipboard', { path: localPath });
+                        toast.success(t('toast.copyImageSuccess'));
+                        return;
+                    }
+                } catch (err) {
+                    console.warn('[copyImage] Native clipboard failed, fallback to web clipboard:', err);
+                }
+            }
+
+            let blob: Blob | null = null;
+
+            // 方案 A：Tauri 优先从本地文件读取，避免 asset/CORS 导致 fetch 失败
+            if (isTauri) {
+                try {
+                    const { readFile } = await import('@tauri-apps/plugin-fs');
+                    const pick = await resolveLocalImagePath([image.filePath, image.thumbnailPath]);
+
+                    if (pick) {
+                        const bytes = await readFile(pick);
+                        blob = new Blob([bytes], { type: guessMime(pick) });
+                    }
+                } catch (err) {
+                    console.warn('[copyImage] Tauri readFile failed, fallback to fetch:', err);
+                }
+            }
+
+            // 方案 B：fetch 当前显示的 URL（适用于 http://asset.localhost 或普通 http/https）
+            if (!blob) {
+                const src = getBestSrc();
+                if (!src) throw new Error(t('toast.imageSrcEmpty'));
+                const response = await fetch(src, { cache: 'no-cache' });
+                if (!response.ok) throw new Error(t('toast.imageFetchFailed', { status: response.status }));
+                blob = await response.blob();
+            }
+
+            // 复制到剪贴板：优先复制图片，兜底复制链接
+            const ClipboardItemCtor = (window as any).ClipboardItem as typeof ClipboardItem | undefined;
+            if (ClipboardItemCtor && navigator.clipboard?.write) {
+                const type = blob.type || guessMime(getBestSrc() || 'image.png');
+                const item = new ClipboardItemCtor({ [type]: blob });
+                try {
+                    await navigator.clipboard.write([item]);
+                    toast.success(t('toast.copyImageSuccess'));
+                    return;
+                } catch (err) {
+                    console.warn('[copyImage] Web clipboard write(image) failed, fallback to writeText:', err);
+                }
+            }
+
+            const src = getBestSrc();
+            if (src && navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(src);
+                toast.info(t('toast.copyImageUnsupported'));
+                return;
+            }
+
+            throw new Error('Clipboard API not available');
+        } catch (error) {
+            console.error('Copy image failed:', error);
+            // 最后兜底：尝试复制链接（避免用户“完全失败”）
+            try {
+            const src = resolvedFullImageSrc || resolvedThumbnailSrc || '';
+            if (src && navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(src);
+                toast.info(t('toast.copyImageFallback'));
+                return;
+            }
+            } catch {}
+            toast.error(t('toast.copyImageFailed'));
+        } finally {
+            setIsCopyingImage(false);
+        }
+    }, [image, isCopyingImage, resolveLocalImagePath, resolvedFullImageSrc, resolvedThumbnailSrc, t]);
+
+    // 处理复制提示词 - 优先使用同步方案，速度最快
+    const handleCopyPrompt = useCallback((text: string, key: 'single' | 'original' | 'optimized') => {
+        if (!text) return;
+
+        // 清除之前的定时器
+        if (copySuccessTimerRef.current) {
+            clearTimeout(copySuccessTimerRef.current);
+        }
+
+        // 方案1: 同步的 document.execCommand (最快，立即返回)
+        const textArea = document.createElement('textarea');
+        textArea.value = text;
+        textArea.style.position = 'fixed';
+        textArea.style.opacity = '0';
+        document.body.appendChild(textArea);
+        textArea.select();
+
+        const successful = document.execCommand('copy');
+        document.body.removeChild(textArea);
+
+        if (successful) {
+            // 成功：立即显示状态（真实成功，不是乐观更新）
+            setCopiedPromptKey(key);
+            toast.success(t('toast.copyPromptSuccess'));
+
+            copySuccessTimerRef.current = setTimeout(() => {
+                setCopiedPromptKey(null);
+            }, 2000);
+        } else {
+            // 方案1失败，尝试方案2: Clipboard API
+            navigator.clipboard.writeText(text)
+                .then(() => {
+                    setCopiedPromptKey(key);
+                    toast.success(t('toast.copyPromptSuccess'));
+
+                    copySuccessTimerRef.current = setTimeout(() => {
+                        setCopiedPromptKey(null);
+                    }, 2000);
+                })
+                .catch((err) => {
+                    console.error('Copy failed:', err);
+                    toast.error(t('toast.copyFailedManual'));
+                });
+        }
+    }, [t]);
+
+    const copyText = useCallback(async (text: string) => {
+        if (!text) return false;
+        try {
+            if (navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(text);
+                return true;
+            }
+        } catch {}
+
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.focus();
+            ta.select();
+            const ok = document.execCommand('copy');
+            document.body.removeChild(ta);
+            return ok;
+        } catch {
+            return false;
+        }
+    }, []);
+
+    const performZoom = (newScale: number, centerX?: number, centerY?: number) => {
+        if (!containerRef.current) return;
+        const oldScale = scale;
+        const rect = containerRef.current.getBoundingClientRect();
+        const cx = centerX ?? rect.width / 2;
+        const cy = centerY ?? rect.height / 2;
+        const ratio = newScale / oldScale;
+        const dx = (cx - rect.width / 2 - position.x);
+        const dy = (cy - rect.height / 2 - position.y);
+        const newX = position.x - dx * (ratio - 1);
+        const newY = position.y - dy * (ratio - 1);
+        setScale(newScale);
+        setPosition({ x: newX, y: newY });
+    };
+
+    const handleWheel = (e: React.WheelEvent) => {
+        const speed = e.ctrlKey ? 0.05 : 0.002;
+        const delta = -e.deltaY * speed;
+        const newScale = Math.min(Math.max(0.25, scale + delta), 10);
+        if (newScale !== scale) {
+            const rect = containerRef.current!.getBoundingClientRect();
+            performZoom(newScale, e.clientX - rect.left, e.clientY - rect.top);
+            setIsWheelZooming(true);
+            if (wheelZoomTimerRef.current) {
+                clearTimeout(wheelZoomTimerRef.current);
+            }
+            wheelZoomTimerRef.current = setTimeout(() => {
+                setIsWheelZooming(false);
+            }, 120);
+        }
+    };
+
+    const handleMouseDown = (e: React.MouseEvent) => {
+        // 点击在右键菜单内部：不触发“关闭菜单/拖拽”逻辑，避免按钮 click 被提前卸载
+        if (contextMenuRef.current && contextMenuRef.current.contains(e.target as Node)) return;
+        // 仅允许鼠标左键拖拽（右键/中键不进入拖拽，避免弹出菜单后“拖拽卡住”）
+        if (e.button !== 0) return;
+        // 右键菜单打开时，左键点击优先用于关闭菜单，不触发拖拽
+        if (contextMenu) {
+            setContextMenu(null);
+            return;
+        }
+        setContextMenu(null);
+        setIsDragging(true);
+        setDragStart({ x: e.clientX - position.x, y: e.clientY - position.y });
+    };
+
+    const handleMouseMove = (e: React.MouseEvent) => {
+        // 兼容：如果已经不按住左键，立即结束拖拽（避免 mouseup 丢失导致一直拖）
+        if (isDragging && (e.buttons & 1) !== 1) {
+            setIsDragging(false);
+            return;
+        }
+        if (isDragging && containerRef.current) {
+            let newX = e.clientX - dragStart.x;
+            let newY = e.clientY - dragStart.y;
+            const rect = containerRef.current.getBoundingClientRect();
+            const limitX = (rect.width * scale) / 2;
+            const limitY = (rect.height * scale) / 2;
+            newX = Math.min(Math.max(newX, -limitX), limitX);
+            newY = Math.min(Math.max(newY, -limitY), limitY);
+            setPosition({ x: newX, y: newY });
+        }
+    };
+
+    const handleOpenContextMenu = (e: React.MouseEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDragging(false);
+
+        // React MouseEvent 的 button: 2 为右键；这里不强依赖，所有 contextmenu 都走自定义菜单
+        setContextMenu({ x: e.clientX, y: e.clientY, adjusted: false });
+    };
+
+    // 右键菜单：点击外部/滚动/缩放/ESC 时关闭
+    useEffect(() => {
+        if (!contextMenu) return;
+
+        const onKeyDown = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') setContextMenu(null);
+        };
+
+        const onPointerDown = (e: MouseEvent) => {
+            const menuEl = contextMenuRef.current;
+            if (menuEl && menuEl.contains(e.target as Node)) return;
+            setContextMenu(null);
+        };
+
+        const onScroll = () => setContextMenu(null);
+        const onResize = () => setContextMenu(null);
+
+        window.addEventListener('keydown', onKeyDown);
+        window.addEventListener('mousedown', onPointerDown, true);
+        window.addEventListener('scroll', onScroll, true);
+        window.addEventListener('resize', onResize);
+        return () => {
+            window.removeEventListener('keydown', onKeyDown);
+            window.removeEventListener('mousedown', onPointerDown, true);
+            window.removeEventListener('scroll', onScroll, true);
+            window.removeEventListener('resize', onResize);
+        };
+    }, [contextMenu]);
+
+    // 右键菜单：防止出屏（第一次渲染后修正位置）
+    useEffect(() => {
+        if (!contextMenu || contextMenu.adjusted) return;
+        const menuEl = contextMenuRef.current;
+        if (!menuEl) return;
+
+        const rect = menuEl.getBoundingClientRect();
+        const padding = 8;
+
+        let nextX = contextMenu.x;
+        let nextY = contextMenu.y;
+        if (nextX + rect.width + padding > window.innerWidth) nextX = window.innerWidth - rect.width - padding;
+        if (nextY + rect.height + padding > window.innerHeight) nextY = window.innerHeight - rect.height - padding;
+        nextX = Math.max(padding, nextX);
+        nextY = Math.max(padding, nextY);
+
+        setContextMenu({ x: nextX, y: nextY, adjusted: true });
+    }, [contextMenu]);
+
+    const handleCopyImagePath = useCallback(async () => {
+        if (!image) return;
+
+        const candidates = [image.filePath, image.thumbnailPath].filter(Boolean) as string[];
+        let path = await resolveLocalImagePath(candidates);
+
+        if (!path) {
+            toast.info(t('toast.imagePathEmpty'));
+            return;
+        }
+
+        const isUrl = /^(https?:|asset:|tauri:|ipc:|blob:|data:)/i.test(path);
+        if (isUrl) {
+            toast.info(t('toast.noLocalPath'));
+            return;
+        }
+
+        if (!path) {
+            toast.info(t('toast.noLocalPath'));
+            return;
+        }
+
+        const ok = await copyText(path);
+        if (ok) toast.success(t('toast.imagePathCopied'));
+        else toast.error(t('toast.copyFailed'));
+    }, [copyText, image, resolveLocalImagePath, t]);
+
+    const handleDownload = useCallback(async () => {
+        if (!image?.id) return;
+
+        try {
+            if (window.__TAURI_INTERNALS__) {
+                await ensureBackendReady();
+
+                const { save } = await import('@tauri-apps/plugin-dialog');
+                const { invoke } = await import('@tauri-apps/api/core');
+
+                const inferExtension = () => {
+                    const candidates = [
+                        image.filePath,
+                        image.thumbnailPath,
+                        resolvedFullImageSrc,
+                        resolvedThumbnailSrc,
+                    ].filter(Boolean) as string[];
+
+                    for (const candidate of candidates) {
+                        const match = candidate.match(/\.([a-zA-Z0-9]+)(?:[?#].*)?$/);
+                        if (match?.[1]) {
+                            return match[1].toLowerCase();
+                        }
+                    }
+
+                    return (image.mimeType || 'image/png').split('/')[1] || 'png';
+                };
+
+                const inferredExt = inferExtension();
+                const defaultName = `image-${image.id}.${inferredExt}`.replace(/[\\/:*?"<>|]/g, '_');
+                const fileExt = defaultName.includes('.') ? defaultName.split('.').pop() || inferredExt : inferredExt;
+
+                const destPath = await save({
+                    defaultPath: defaultName,
+                    filters: [{ name: 'Image', extensions: [fileExt] }]
+                });
+
+                if (!destPath) return;
+
+                await invoke('download_file_to_path', {
+                    url: getImageDownloadUrl(image.id),
+                    destPath,
+                });
+                toast.success(t('toast.downloadSuccess'));
+                return;
+            }
+
+            window.location.href = getImageDownloadUrl(image.id);
+        } catch (error) {
+            console.error('Download failed:', error);
+            toast.error(t('toast.downloadFailed'));
+        }
+    }, [image, t]);
+
+    if (!image) return null;
+
+    return (
+        <Modal 
+            isOpen={!!image} 
+            onClose={onClose} 
+            hideHeader={true} 
+            variant="unstyled"
+            className="max-w-[95vw] md:max-w-7xl h-[90vh] md:h-[90vh] flex flex-col pointer-events-none p-0 overflow-visible"
+        >
+            <div className="bg-white rounded-xl shadow-2xl overflow-hidden w-full h-full flex flex-col md:flex-row pointer-events-auto relative">
+                
+                {/* 侧边导航按钮 - 左 */}
+                {hasPrev && (
+                    <button 
+                        onClick={(e) => { e.stopPropagation(); goToPrev(); }}
+                        className="absolute left-4 sm:left-6 top-1/2 -translate-y-1/2 z-30 p-3 sm:p-4 bg-black/40 hover:bg-black/60 text-white rounded-full border border-white/20 backdrop-blur-md transition-all active:scale-90 group"
+                    >
+                        <ChevronLeft className="w-6 h-6 sm:w-8 sm:h-8 group-hover:-translate-x-1 transition-transform" strokeWidth={3} />
+                    </button>
+                )}
+
+                {/* 侧边导航按钮 - 右 (桌面端位置) */}
+                {hasNext && (
+                    <button 
+                        onClick={(e) => { e.stopPropagation(); goToNext(); }}
+                        className="absolute right-[432px] top-1/2 -translate-y-1/2 z-30 p-4 bg-black/40 hover:bg-black/60 text-white rounded-full border border-white/20 backdrop-blur-md transition-all active:scale-90 group hidden md:block"
+                    >
+                        <ChevronRight className="w-8 h-8 group-hover:translate-x-1 transition-transform" strokeWidth={3} />
+                    </button>
+                )}
+
+                {/* 侧边导航按钮 - 右 (移动端位置) */}
+                {hasNext && (
+                    <button 
+                        onClick={(e) => { e.stopPropagation(); goToNext(); }}
+                        className="absolute right-4 sm:right-6 top-1/2 -translate-y-1/2 z-30 p-3 sm:p-4 bg-black/40 hover:bg-black/60 text-white rounded-full border border-white/20 backdrop-blur-md transition-all active:scale-90 md:hidden"
+                    >
+                        <ChevronRight className="w-6 h-6 sm:w-8 sm:h-8" strokeWidth={3} />
+                    </button>
+                )}
+
+                {/* 左侧：图片展示区 (移动端改为 50% 高度或自适应) */}
+                <div 
+                    ref={containerRef}
+                    className={`flex-1 bg-slate-50 relative min-h-[50vh] md:min-h-full overflow-hidden ${isFailedImage ? '' : 'cursor-grab active:cursor-grabbing'}`}
+                    onWheel={isFailedImage ? undefined : handleWheel}
+                    onMouseDown={isFailedImage ? undefined : handleMouseDown}
+                    onMouseMove={isFailedImage ? undefined : handleMouseMove}
+                    onMouseUp={isFailedImage ? undefined : () => { setIsDragging(false); }}
+                    onMouseLeave={isFailedImage ? undefined : () => { setIsDragging(false); }}
+                >
+                    {isFailedImage ? (
+                        // 失败状态占位图
+                        <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-50">
+                            <div className="w-24 h-24 rounded-full bg-slate-100 flex items-center justify-center mb-5">
+                                <ImageOff className="w-12 h-12 text-slate-400" />
+                            </div>
+                            <p className="text-lg font-bold text-slate-700 mb-3">{t('preview.failed.title')}</p>
+                            <div className="w-full max-w-2xl mx-8 px-4">
+                                {localizedError?.errorMessage && (
+                                    <p className="text-sm text-slate-500 text-center mb-4 leading-relaxed">
+                                        {localizedError.errorMessage}
+                                    </p>
+                                )}
+
+                                {(failedDetails.length > 0 || localizedError?.errorDetail || localizedError?.errorRawMessage) && (
+                                    <div className="rounded-2xl border border-slate-200 bg-white shadow-sm p-4 text-left">
+                                        <p className="text-xs font-bold uppercase tracking-wide text-slate-500 mb-3">
+                                            {t('preview.failed.detailsTitle')}
+                                        </p>
+
+                                        {failedDetails.length > 0 && (
+                                            <div className="space-y-2 mb-3">
+                                                {failedDetails.map((item) => (
+                                                    <div key={`${item.label}-${item.value}`} className="grid grid-cols-[92px_1fr] gap-3 text-xs">
+                                                        <span className="text-slate-500 font-medium">{item.label}</span>
+                                                        <span className="text-slate-800 break-all">{item.value}</span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+
+                                        {localizedError?.errorDetail && (
+                                            <div className="mb-3">
+                                                <p className="text-xs text-slate-500 font-medium mb-1">{t('preview.failed.errorDetail')}</p>
+                                                <p className="text-xs text-slate-700 leading-relaxed break-words whitespace-pre-wrap">{localizedError.errorDetail}</p>
+                                            </div>
+                                        )}
+
+                                        {localizedError?.errorRawMessage && (
+                                            <div className="mb-1">
+                                                <p className="text-xs text-slate-500 font-medium mb-1">{t('preview.failed.rawError')}</p>
+                                                <pre className="text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-xl p-3 whitespace-pre-wrap break-words font-mono">
+                                                    {localizedError.errorRawMessage}
+                                                </pre>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
+                                <button
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        void (async () => {
+                                            const ok = await copyText(failedCopyText || localizedError?.errorMessage || image.errorMessage || '');
+                                            if (ok) {
+                                                toast.success(t('preview.failed.errorCopied'));
+                                            } else {
+                                                toast.error(t('toast.copyFailed'));
+                                            }
+                                        })();
+                                    }}
+                                    className="mx-auto mt-4 flex items-center gap-1.5 text-xs text-blue-600 hover:text-blue-700 font-medium"
+                                >
+                                    <Copy className="w-3.5 h-3.5" />
+                                    {t('preview.failed.copyError')}
+                                </button>
+                            </div>
+                        </div>
+                    ) : (
+                        <>
+                            <div className="absolute inset-0 z-0 pointer-events-none select-none">
+                                        <img 
+                                        src={resolvedThumbnailSrc || resolvedFullImageSrc} 
+                                    alt="" 
+                                    className="w-full h-full object-cover opacity-30 blur-3xl scale-110 transition-opacity duration-700" 
+                                    decoding="async"
+                                />
+                                <div className="absolute inset-0 bg-white/10" />
+                            </div>
+
+                            {/* 右上角操作区：复制/关闭/缩放比例（不随图片缩放） */}
+                            <div className="absolute top-6 right-4 z-50 flex flex-col items-end gap-2 pointer-events-auto">
+                                <button
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleCopyImage();
+                                    }}
+                                    onMouseDown={(e) => e.stopPropagation()}
+                                    disabled={!resolvedFullImageSrc && !resolvedThumbnailSrc && !image.filePath && !image.thumbnailPath}
+                                    className={`
+                                        px-3 py-2 bg-black/60 hover:bg-black/75 text-white rounded-xl shadow-xl border border-white/15 backdrop-blur-md transition-all active:scale-95
+                                        flex items-center gap-2
+                                        disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:bg-black/60
+                                    `}
+                                    title={t('preview.copyImage')}
+                                    style={{ WebkitAppRegion: 'no-drag' } as any}
+                                >
+                                    {isCopyingImage ? (
+                                        <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                                    ) : (
+                                        <Copy className="w-4 h-4" />
+                                    )}
+                                    <span className="hidden sm:inline text-[11px] font-black pr-1">{t('preview.copyImage')}</span>
+                                </button>
+                            </div>
+
+                            <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1 p-1.5 bg-white/90 backdrop-blur-xl border border-white/50 rounded-2xl shadow-2xl">
+                                <button onClick={() => performZoom(Math.max(0.25, scale - 0.25))} className="p-2.5 hover:bg-white rounded-xl transition-all text-slate-600"><ZoomOut className="w-4 h-4" /></button>
+                                <div className="w-px h-4 bg-slate-200 mx-1" />
+                                <button onClick={handleReset} className="px-4 py-1.5 hover:bg-white rounded-xl transition-all text-slate-700 text-[11px] font-black">{Math.round(scale * 100)}%</button>
+                                <div className="w-px h-4 bg-slate-200 mx-1" />
+                                <button onClick={() => performZoom(Math.min(10, scale + 0.25))} className="p-2.5 hover:bg-white rounded-xl transition-all text-slate-600"><ZoomIn className="w-4 h-4" /></button>
+                            </div>
+
+                            <div
+                                className="relative z-10 w-full h-full flex items-center justify-center select-none p-5 md:p-7"
+                                style={{
+                                    transform: `translate(${displayPosition.x}px, ${displayPosition.y}px) scale(${scale})`,
+                                    transition: isDragging || isWheelZooming ? 'none' : 'transform 0.15s cubic-bezier(0.2, 0, 0.2, 1)',
+                                    willChange: isDragging || isWheelZooming ? 'transform' : undefined
+                                }}
+                                onContextMenu={handleOpenContextMenu}
+                            >
+
+                                {/* 缩略图占位 (模糊) */}
+                                {!fullImageLoaded && (
+                                    <img 
+                                        src={resolvedThumbnailSrc || resolvedFullImageSrc} 
+                                        alt="" 
+                                        className={`max-w-full max-h-full object-contain absolute ${
+                                          fullImageError ? 'opacity-100 scale-100' : 'blur-lg scale-95 opacity-50'
+                                        }`} 
+                                        decoding="async"
+                                        draggable={false} 
+                                    />
+                                )}
+                                
+                                {/* 高清大图 */}
+                                <img 
+                                    ref={imageRef} 
+                                    src={resolvedFullImageSrc} 
+                                    alt={image.prompt} 
+                                    onLoad={() => setFullImageLoaded(true)}
+                                    onError={() => {
+                                        console.error('[ImagePreview] Full image failed to load', {
+                                            src: resolvedFullImageSrc,
+                                            thumbnailSrc: resolvedThumbnailSrc,
+                                            filePath: image.filePath,
+                                            thumbnailPath: image.thumbnailPath,
+                                            imageUrl: image.url,
+                                            thumbnailUrl: image.thumbnailUrl,
+                                            baseUrl: BASE_URL,
+                                            taskId: image.taskId,
+                                            imageId: image.id,
+                                        });
+                                        setFullImageError(true);
+                                    }}
+                                    className={`max-w-full max-h-full object-contain shadow-2xl rounded-lg transition-all duration-500 ${fullImageLoaded ? 'opacity-100 scale-100' : 'opacity-0 scale-95'}`}
+                                    decoding="async"
+                                    draggable={false} 
+                                />
+
+                                {/* 加载指示器 */}
+                                {!fullImageLoaded && !fullImageError && (
+                                    <div className="absolute inset-0 flex items-center justify-center">
+                                        <div className="w-10 h-10 border-4 border-slate-200 border-t-blue-600 rounded-full animate-spin shadow-lg" />
+                                    </div>
+                                )}
+
+                                {/* 加载失败提示 */}
+                                {fullImageError && !fullImageLoaded && (
+                                    <div className="absolute inset-0 flex items-center justify-center">
+                                        <div className="px-4 py-2 rounded-xl bg-black/70 text-white text-xs font-bold backdrop-blur-md">
+                                            {t('preview.imageLoadFailed')}
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* 自定义右键菜单（替代系统英文菜单） */}
+                            {contextMenu && (
+                                <div
+                                    ref={contextMenuRef}
+                                    className="fixed z-[1000] min-w-[180px] bg-white/95 backdrop-blur-xl border border-slate-200/70 rounded-2xl shadow-[0_18px_60px_-18px_rgba(0,0,0,0.35)] overflow-hidden"
+                                    style={{ left: contextMenu.x, top: contextMenu.y }}
+                                    role="menu"
+                                    aria-label={t('preview.menu.label')}
+                                    onClick={(e) => e.stopPropagation()}
+                                    onMouseDown={(e) => {
+                                        // 防止 mousedown 冒泡到图片容器导致先关闭菜单，从而 click 不触发
+                                        e.stopPropagation();
+                                    }}
+                                    onContextMenu={(e) => {
+                                        // 菜单区域内右键不再触发新的菜单
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                    }}
+                                >
+                                    <button
+                                        type="button"
+                                        className="w-full px-4 py-3 flex items-center gap-3 text-sm font-bold text-slate-800 hover:bg-slate-100/70 transition-colors"
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            setContextMenu(null);
+                                            handleCopyImage();
+                                        }}
+                                        role="menuitem"
+                                    >
+                                        <Copy className="w-4 h-4 text-slate-600" />
+                                        {t('preview.menu.copyImage')}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="w-full px-4 py-3 flex items-center gap-3 text-sm font-bold text-slate-800 hover:bg-slate-100/70 transition-colors"
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            setContextMenu(null);
+                                            handleCopyImagePath();
+                                        }}
+                                        role="menuitem"
+                                    >
+                                        <Copy className="w-4 h-4 text-slate-600" />
+                                        {t('preview.menu.copyImagePath')}
+                                    </button>
+                                    <div className="h-px bg-slate-200/60" />
+                                    <button
+                                        type="button"
+                                        className="w-full px-4 py-3 flex items-center gap-3 text-sm font-bold text-slate-800 hover:bg-slate-100/70 transition-colors"
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            setContextMenu(null);
+                                            handleDownload();
+                                        }}
+                                        role="menuitem"
+                                    >
+                                        <Download className="w-4 h-4 text-slate-600" />
+                                        {t('preview.menu.downloadOriginal')}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className="w-full px-4 py-3 flex items-center gap-3 text-sm font-bold text-slate-800 hover:bg-slate-100/70 transition-colors"
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            setContextMenu(null);
+                                            handleReset();
+                                        }}
+                                        role="menuitem"
+                                    >
+                                        <Maximize2 className="w-4 h-4 text-slate-600" />
+                                        {t('preview.menu.resetZoom')}
+                                    </button>
+                                </div>
+                            )}
+                        </>
+                    )}
+                </div>
+
+                {/* 右侧：信息详情区 */}
+                <div className="w-full md:w-[400px] flex-shrink-0 bg-white border-l border-slate-100 flex flex-col h-full relative z-20">
+                    <div className="flex-1 flex flex-col min-h-0 p-8 pb-4">
+                        {/* 标题和按钮行 */}
+                        <div className="flex items-center justify-between mb-6 flex-shrink-0 gap-4">
+                            <h2 className="text-xl font-black text-slate-900 leading-none">{t('preview.title')}</h2>
+                            <div className="flex items-center gap-2 flex-shrink-0">
+                                {/* 删除按钮 */}
+                                <button
+                                    onClick={handleDelete}
+                                    disabled={isDeleting}
+                                    className={`
+                                        inline-flex items-center justify-center gap-2 rounded-2xl font-bold transition-all duration-200
+                                        px-4 py-2 text-sm leading-none
+                                        ${showDeleteConfirm
+                                            ? 'bg-red-600 text-white hover:bg-red-700 shadow-md shadow-red-200'
+                                            : 'bg-slate-100 text-slate-700 hover:bg-slate-200 shadow-sm'
+                                        }
+                                        active:scale-95
+                                        ${isDeleting ? 'opacity-50 cursor-not-allowed' : ''}
+                                    `}
+                                    title={showDeleteConfirm ? t('preview.delete.confirmTitle') : t('preview.delete.title')}
+                                >
+                                    {isDeleting ? (
+                                        <>
+                                            <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                                            {t('preview.delete.deleting')}
+                                        </>
+                                    ) : showDeleteConfirm ? (
+                                        <>
+                                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                            </svg>
+                                            {t('preview.delete.confirmLabel')}
+                                        </>
+                                    ) : (
+                                        <>
+                                            <Trash2 className="w-4 h-4" />
+                                            {t('preview.delete.action')}
+                                        </>
+                                    )}
+                                </button>
+                                {/* 取消删除按钮 - 只在确认状态时显示 */}
+                                {showDeleteConfirm && (
+                                    <button
+                                        onClick={handleCancelDelete}
+                                        className="inline-flex items-center justify-center rounded-2xl font-bold transition-all duration-200 px-4 py-2 text-sm leading-none bg-slate-100 text-slate-700 hover:bg-slate-200 shadow-sm active:scale-95"
+                                        title={t('common.cancel')}
+                                    >
+                                        {t('common.cancel')}
+                                    </button>
+                                )}
+                                {/* 关闭按钮 */}
+                                <button onClick={onClose} className="text-slate-400 hover:text-slate-900 p-1 transition-colors">
+                                    <X className="w-6 h-6" />
+                                </button>
+                            </div>
+                        </div>
+                        <div className="flex-1 flex flex-col min-h-0">
+                            {!hasOptimizedPromptPair ? (
+                                <>
+                                    <div className="flex items-center justify-between mb-3 flex-shrink-0">
+                                        <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest">{t('preview.prompt.label')}</h3>
+                                        <button
+                                            onClick={() => handleCopyPrompt(singlePromptText, 'single')}
+                                            disabled={!singlePromptText}
+                                            className={`
+                                                text-xs font-bold flex items-center gap-1.5 py-1 px-2 rounded-lg transition-all
+                                                ${!singlePromptText
+                                                    ? 'text-slate-400 cursor-not-allowed bg-slate-50'
+                                                    : copiedPromptKey === 'single'
+                                                        ? 'text-green-600 bg-green-50'
+                                                        : 'text-blue-600 hover:text-blue-700 hover:bg-blue-50'
+                                                }
+                                            `}
+                                        >
+                                            {copiedPromptKey === 'single' ? (
+                                                <>
+                                                    <Check className="w-3.5 h-3.5" /> {t('preview.prompt.copied')}
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <Copy className="w-3.5 h-3.5" /> {t('common.copy')}
+                                                </>
+                                            )}
+                                        </button>
+                                    </div>
+                                    <div className="flex-1 bg-slate-50 p-5 rounded-2xl border border-slate-100 text-sm text-slate-700 leading-relaxed whitespace-pre-wrap overflow-y-auto scrollbar-thin">
+                                        {singlePromptText || t('preview.prompt.empty')}
+                                    </div>
+                                </>
+                            ) : (
+                                <div className="flex-1 space-y-3 overflow-y-auto pr-1 scrollbar-thin">
+                                    <div className="rounded-2xl border border-slate-200 bg-slate-50">
+                                        <div className="flex items-center justify-between gap-3 px-4 py-3">
+                                            <button
+                                                type="button"
+                                                onClick={() => setShowOptimizedPrompt((value) => !value)}
+                                                className="flex-1 text-left"
+                                            >
+                                                <div className="text-xs font-bold text-slate-400 uppercase tracking-widest">{t('preview.prompt.optimizedLabel')}</div>
+                                                <div className="mt-1 text-xs text-slate-500">
+                                                    {showOptimizedPrompt ? t('preview.prompt.collapse') : t('preview.prompt.expand')}
+                                                </div>
+                                            </button>
+                                            <button
+                                                onClick={() => handleCopyPrompt(optimizedPromptText, 'optimized')}
+                                                disabled={!optimizedPromptText}
+                                                className={`
+                                                    text-xs font-bold flex items-center gap-1.5 py-1 px-2 rounded-lg transition-all
+                                                    ${!optimizedPromptText
+                                                        ? 'text-slate-400 cursor-not-allowed bg-white'
+                                                        : copiedPromptKey === 'optimized'
+                                                            ? 'text-green-600 bg-green-50'
+                                                            : 'text-blue-600 hover:text-blue-700 hover:bg-white'
+                                                    }
+                                                `}
+                                            >
+                                                {copiedPromptKey === 'optimized' ? (
+                                                    <>
+                                                        <Check className="w-3.5 h-3.5" /> {t('preview.prompt.copied')}
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        <Copy className="w-3.5 h-3.5" /> {t('common.copy')}
+                                                    </>
+                                                )}
+                                            </button>
+                                        </div>
+                                        {showOptimizedPrompt && (
+                                            <div className="border-t border-slate-200 px-4 py-4 text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">
+                                                {optimizedPromptText || t('preview.prompt.empty')}
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    <div className="rounded-2xl border border-slate-200 bg-white">
+                                        <div className="flex items-center justify-between gap-3 px-4 py-3">
+                                            <button
+                                                type="button"
+                                                onClick={() => setShowOriginalPrompt((value) => !value)}
+                                                className="flex-1 text-left"
+                                            >
+                                                <div className="text-xs font-bold text-slate-400 uppercase tracking-widest">{t('preview.prompt.originalLabel')}</div>
+                                                <div className="mt-1 text-xs text-slate-500">
+                                                    {showOriginalPrompt ? t('preview.prompt.collapse') : t('preview.prompt.expand')}
+                                                </div>
+                                            </button>
+                                            <button
+                                                onClick={() => handleCopyPrompt(originalPromptText, 'original')}
+                                                disabled={!originalPromptText}
+                                                className={`
+                                                    text-xs font-bold flex items-center gap-1.5 py-1 px-2 rounded-lg transition-all
+                                                    ${!originalPromptText
+                                                        ? 'text-slate-400 cursor-not-allowed bg-slate-50'
+                                                        : copiedPromptKey === 'original'
+                                                            ? 'text-green-600 bg-green-50'
+                                                            : 'text-blue-600 hover:text-blue-700 hover:bg-slate-50'
+                                                    }
+                                                `}
+                                            >
+                                                {copiedPromptKey === 'original' ? (
+                                                    <>
+                                                        <Check className="w-3.5 h-3.5" /> {t('preview.prompt.copied')}
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        <Copy className="w-3.5 h-3.5" /> {t('common.copy')}
+                                                    </>
+                                                )}
+                                            </button>
+                                        </div>
+                                        {showOriginalPrompt && (
+                                            <div className="border-t border-slate-200 px-4 py-4 text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">
+                                                {originalPromptText || t('preview.prompt.empty')}
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    <div className="flex-shrink-0">
+                        <div className="px-8 py-5 space-y-4 border-t border-slate-50 bg-white">
+                            <div className="flex items-center justify-between text-sm">
+                                <span className="text-slate-400 font-medium flex items-center gap-2.5"><Box className="w-4 h-4" /> {t('preview.meta.model')}</span>
+                                <span className="font-bold text-slate-900 truncate max-w-[200px]" title={image.model || t('preview.meta.unknown')}>{image.model || t('preview.meta.unknown')}</span>
+                            </div>
+                            <div className="flex items-center justify-between text-sm">
+                                <span className="text-slate-400 font-medium flex items-center gap-2.5"><Maximize2 className="w-4 h-4" /> {t('preview.meta.size')}</span>
+                                <span className="font-bold text-slate-900 font-mono">{image.width || 0} × {image.height || 0}</span>
+                            </div>
+                            <div className="flex items-center justify-between text-sm">
+                                <span className="text-slate-400 font-medium flex items-center gap-2.5"><Calendar className="w-4 h-4" /> {t('preview.meta.time')}</span>
+                                <span className="font-bold text-slate-900">{formatDateTime(image.createdAt || '')}</span>
+                            </div>
+                        </div>
+                        {!isFailedImage && (
+                            <div className="p-8 pt-3">
+                                <Button className="w-full h-14 bg-slate-900 hover:bg-black text-white" onClick={handleDownload}>
+                                    <Download className="w-5 h-5 mr-3" /> {t('preview.downloadOriginal')}
+                                </Button>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+        </Modal>
+    );
+});

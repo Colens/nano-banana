@@ -1,0 +1,72 @@
+/bin/
+/storage/local/*.db
+/storage/local/*.jpg
+/storage/local/*.png
+/storage/local/*.gif
+/storage/local/*.webp
+.DS_Store
+
+# 二进制文件
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+backend/text-to-image-backend
+
+# 测试文件
+*.test
+*.out
+
+# 依赖目录
+vendor/
+
+# Go 工作区文件
+go.work
+
+# IDE 配置文件
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 日志文件
+*.log
+logs/
+
+# 数据文件
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# 配置文件（包含敏感信息）
+config/config.yaml
+.env
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+
+# 前端构建产物
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+frontend/.next/
+frontend/out/
+
+# 前端缓存
+frontend/.cache/
+frontend/.parcel-cache/
+
+# 前端环境变量
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local

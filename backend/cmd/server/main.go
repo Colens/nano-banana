@@ -1,0 +1,395 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"image-gen-service/internal/api"
+	"image-gen-service/internal/config"
+	"image-gen-service/internal/model"
+	"image-gen-service/internal/platform"
+	"image-gen-service/internal/provider"
+	"image-gen-service/internal/storage"
+	"image-gen-service/internal/templates"
+	"image-gen-service/internal/worker"
+
+	"github.com/gin-gonic/gin"
+)
+
+func getWorkDir() string {
+	// 如果是作为 Tauri 边车运行，使用用户目录下的应用支持目录
+	if platform.IsTauriSidecar() {
+		configDir, err := os.UserConfigDir()
+		if err == nil {
+			appDir := configDir + "/com.dztool.banana"
+			_ = os.MkdirAll(appDir, 0755)
+			return appDir
+		}
+	}
+	return "."
+}
+
+func isLoopbackOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u == nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func isNullOrigin(origin string) bool {
+	return strings.EqualFold(strings.TrimSpace(origin), "null")
+}
+
+func isAllowedTauriOrigin(origin string) bool {
+	origin = strings.TrimSpace(origin)
+	if origin == "" || isNullOrigin(origin) {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u == nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	if host == "tauri.localhost" {
+		scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+		return scheme == "http" || scheme == "https"
+	}
+	if !strings.EqualFold(u.Scheme, "tauri") {
+		return isLoopbackOrigin(origin)
+	}
+	if !strings.EqualFold(host, "localhost") {
+		return false
+	}
+	if strings.TrimSpace(u.Path) != "" && strings.TrimSpace(u.Path) != "/" {
+		return false
+	}
+	return true
+}
+
+func loadCORSAllowlistFromEnv() map[string]struct{} {
+	raw := strings.TrimSpace(os.Getenv("CORS_ALLOW_ORIGINS"))
+	if raw == "" {
+		return map[string]struct{}{}
+	}
+	allowlist := make(map[string]struct{})
+	for _, part := range strings.Split(raw, ",") {
+		v := strings.TrimSpace(part)
+		if v == "" {
+			continue
+		}
+		allowlist[v] = struct{}{}
+	}
+	return allowlist
+}
+
+func originInAllowlist(origin string, allowlist map[string]struct{}) bool {
+	if len(allowlist) == 0 {
+		return false
+	}
+	_, ok := allowlist[origin]
+	return ok
+}
+
+func allowlistHasWildcard(allowlist map[string]struct{}) bool {
+	_, ok := allowlist["*"]
+	return ok
+}
+
+// isRunningInDocker 检测是否运行在 Docker 容器中
+// 使用多种检测方式组合，确保可靠性
+func isRunningInDocker() bool {
+	// 方法 1: 检查 /.dockerenv 文件（Docker 自动创建此文件）
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+
+	// 方法 2: 检查 /proc/1/cgroup 内容（Linux 容器标准方法）
+	if data, err := os.ReadFile("/proc/1/cgroup"); err == nil {
+		content := string(data)
+		// 包含以下任一字符串说明在容器中
+		if strings.Contains(content, "docker") ||
+			strings.Contains(content, "kubepods") ||
+			strings.Contains(content, "containerd") {
+			return true
+		}
+	}
+
+	// 方法 3: 检查环境变量（可选，作为辅助验证）
+	// Docker 和 Kubernetes 通常会设置这些环境变量
+	if os.Getenv("DOCKER_CONTAINER") != "" ||
+		os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		return true
+	}
+
+	return false
+}
+
+// getDefaultHost 根据环境自动选择合适的监听地址
+// 优先级: 环境变量 > 自动检测 > 默认值
+func getDefaultHost(configuredHost string) string {
+	// 1. 如果配置文件中已指定，直接使用
+	configuredHost = strings.TrimSpace(configuredHost)
+	if configuredHost != "" {
+		return configuredHost
+	}
+
+	// 2. 优先使用环境变量（保持灵活性，可手动覆盖）
+	if envHost := os.Getenv("SERVER_HOST"); envHost != "" {
+		log.Printf("使用环境变量 SERVER_HOST=%s", envHost)
+		return envHost
+	}
+
+	// 3. 自动检测运行环境
+	if isRunningInDocker() {
+		log.Printf("检测到 Docker 容器环境，使用监听地址 0.0.0.0")
+		return "0.0.0.0"
+	}
+
+	// 4. 默认使用 127.0.0.1（Tauri 和本地开发环境）
+	log.Printf("使用默认监听地址 127.0.0.1")
+	return "127.0.0.1"
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		// SSE 任务流需要在长时间生成期间持续保活，不能用全局写超时截断连接。
+		WriteTimeout: 0,
+		IdleTimeout:  120 * time.Second,
+	}
+}
+
+func main() {
+	workDir := getWorkDir()
+	log.Printf("Working directory: %s", workDir)
+	_ = os.Chdir(workDir)
+
+	// 1. 初始化配置
+	config.InitConfig()
+
+	// 2. 初始化数据库
+	model.InitDB(config.GlobalConfig.Database.Path)
+
+	// 3. 初始化存储
+	var ossConfig map[string]string
+	if config.GlobalConfig.Storage.OSS.Enabled {
+		ossConfig = map[string]string{
+			"endpoint":        config.GlobalConfig.Storage.OSS.Endpoint,
+			"accessKeyID":     config.GlobalConfig.Storage.OSS.AccessKeyID,
+			"accessKeySecret": config.GlobalConfig.Storage.OSS.AccessKeySecret,
+			"bucketName":      config.GlobalConfig.Storage.OSS.BucketName,
+			"domain":          config.GlobalConfig.Storage.OSS.Domain,
+		}
+	}
+	storage.InitStorage(config.GlobalConfig.Storage.LocalDir, ossConfig)
+
+	// 3.5 初始化模板市场
+	templates.InitStore(templates.Options{
+		RemoteURL: config.GlobalConfig.Templates.RemoteURL,
+		CachePath: filepath.Join(workDir, "templates_cache.json"),
+		Timeout:   time.Duration(config.GlobalConfig.Templates.FetchTimeoutSeconds) * time.Second,
+	})
+
+	// 4. 初始化 Worker 池 (2C2G 服务器，推荐 6 个 worker)
+	worker.InitPool(6, 100)
+	worker.Pool.Start()
+
+	// 5. 注册 Provider
+	provider.InitProviders()
+
+	// 5. 设置路由
+	r := gin.Default()
+	corsAllowlist := loadCORSAllowlistFromEnv()
+
+	// 允许跨域请求
+	r.Use(func(c *gin.Context) {
+		origin := c.Request.Header.Get("Origin")
+		log.Printf("[CORS] Request from Origin: %s, Method: %s, Path: %s", origin, c.Request.Method, c.Request.URL.Path)
+
+		if platform.IsTauriSidecar() {
+			if !isAllowedTauriOrigin(origin) {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+					"code":    403,
+					"message": "origin not allowed",
+					"data":    nil,
+				})
+				return
+			}
+			if origin != "" {
+				c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+			}
+			c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+		} else {
+			trimmedOrigin := strings.TrimSpace(origin)
+			hasWildcard := allowlistHasWildcard(corsAllowlist)
+			if isNullOrigin(trimmedOrigin) {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+					"code":    403,
+					"message": "origin not allowed",
+					"data":    nil,
+				})
+				return
+			} else if trimmedOrigin == "" || (hasWildcard && len(corsAllowlist) > 0) {
+				c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+			} else if len(corsAllowlist) == 0 {
+				// 非 Tauri 模式默认放开跨域，但不允许携带凭证，避免“反射 Origin + credentials”风险
+				c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+			} else if originInAllowlist(trimmedOrigin, corsAllowlist) {
+				c.Writer.Header().Set("Access-Control-Allow-Origin", trimmedOrigin)
+				c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+			} else {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+					"code":    403,
+					"message": "origin not allowed",
+					"data":    nil,
+				})
+				return
+			}
+		}
+
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, *")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE, PATCH")
+
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+		c.Next()
+	})
+
+	v1 := r.Group("/api/v1")
+	{
+		v1.GET("/health", func(c *gin.Context) {
+			api.Success(c, gin.H{"status": "ok", "message": "ok"})
+		})
+		v1.GET("/templates", api.ListTemplatesHandler)
+		v1.GET("/template-image", api.TemplateImageProxyHandler)
+		v1.GET("/providers", api.ListProvidersHandler)
+		v1.GET("/providers/config", api.ListProviderConfigsHandler)
+		v1.POST("/providers/config", api.UpdateProviderConfigHandler)
+		v1.POST("/prompts/optimize", api.OptimizePromptHandler)
+		v1.POST("/prompts/image-to-prompt", api.ImageToPromptHandler)
+		v1.POST("/tasks/generate", api.GenerateHandler)
+		v1.POST("/tasks/generate-with-images", api.GenerateWithImagesHandler)
+		v1.GET("/tasks/:task_id", api.GetTaskHandler)
+		v1.GET("/tasks/:task_id/stream", api.StreamTaskHandler)
+		v1.GET("/images", api.ListImagesHandler)
+		v1.POST("/images/export", api.ExportImagesHandler)
+		v1.DELETE("/images/:id", api.DeleteImageHandler)
+		v1.GET("/images/:id/download", api.DownloadImageHandler)
+		// 文件夹管理 API
+		v1.POST("/folders", api.CreateFolderHandler)                 // 创建手动文件夹
+		v1.GET("/folders", api.GetFoldersHandler)                    // 查询所有文件夹
+		v1.GET("/folders/:id/images", api.GetFolderImagesHandler)    // 查询文件夹内图片
+		v1.PUT("/folders/:id", api.UpdateFolderHandler)              // 重命名文件夹
+		v1.DELETE("/folders/:id", api.DeleteFolderHandler)           // 删除手动文件夹
+		v1.POST("/folders/month", api.GetOrCreateMonthFolderHandler) // 按需获取或创建月份文件夹
+		v1.POST("/folders/move-image", api.MoveImageHandler)         // 移动图片
+	}
+
+	// 静态资源访问 (将 storage 目录整体暴露，以匹配数据库中的 storage/local/xxx.jpg 路径)
+	// 针对本地存储增加缓存头，优化前端加载性能
+	r.Group("/storage", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000") // 1年缓存，因为本地文件路径通常包含唯一 ID
+		c.Next()
+	}).Static("", "storage")
+
+	// 6. 端口探测与启动
+	port := config.GlobalConfig.Server.Port
+	if port <= 0 {
+		port = 8080
+	}
+	// 自动检测运行环境并选择合适的监听地址
+	host := getDefaultHost(config.GlobalConfig.Server.Host)
+	var ln net.Listener
+	var err error
+
+	log.Printf("Starting port discovery from %s:%d...", host, port)
+
+	// 尝试从 8080 开始寻找可用端口
+	// 默认绑定到 127.0.0.1 避免 macOS 沙盒拦截 0.0.0.0
+	for i := 0; i < 100; i++ {
+		addr := net.JoinHostPort(host, strconv.Itoa(port+i))
+		ln, err = net.Listen("tcp", addr)
+		if err == nil {
+			port = port + i
+			break
+		}
+		log.Printf("Port %d is busy, trying next...", port+i)
+	}
+
+	if err != nil {
+		log.Fatalf("Fatal: Could not find any available port: %v", err)
+	}
+
+	log.Printf("Successfully bound to %s:%d", host, port)
+
+	// 如果是在 Tauri 边车模式下，将实际监听的端口打印到标准输出，方便前端发现
+	fmt.Printf("SERVER_PORT=%d\n", port)
+	os.Stdout.Sync()
+
+	// 监听标准输入，用于检测父进程是否退出（仅 Tauri 边车模式）
+	// Docker 环境中通过 DISABLE_STDIN_MONITOR 环境变量禁用
+	if os.Getenv("DISABLE_STDIN_MONITOR") == "" {
+		go func() {
+			buf := make([]byte, 1)
+			for {
+				_, err := os.Stdin.Read(buf)
+				if err != nil {
+					log.Printf("检测到标准输入关闭或异常 (%v)，正在安全退出...", err)
+					// 发送退出信号
+					p, _ := os.FindProcess(os.Getpid())
+					p.Signal(syscall.SIGTERM)
+					return
+				}
+			}
+		}()
+	} else {
+		log.Println("标准输入监听已禁用（Docker/生产模式）")
+	}
+
+	srv := newHTTPServer(net.JoinHostPort(host, strconv.Itoa(port)), r)
+
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("启动服务失败: %v", err)
+		}
+	}()
+
+	// 等待中断信号
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("正在关闭服务...")
+
+	// 停止僵尸任务回收器，避免后台 ticker/goroutine 泄漏
+	model.StopZombieTaskReconciler()
+
+	// 优雅停止 Worker 池
+	worker.Pool.Stop()
+
+	// 优雅停止 HTTP 服务
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatal("服务器强制关闭:", err)
+	}
+
+	log.Println("服务已安全退出")
+}

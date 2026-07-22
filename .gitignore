@@ -1,0 +1,112 @@
+# IDE
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backend (Go)
+backend/bin/
+bin/
+backend/dist/
+backend/*.exe
+backend/*.test
+backend/data/*.db
+backend/data/*.db-journal
+backend/storage/local/
+backend/configs/config.yaml
+backend/.env
+backend/scripts/yunwuhttp/
+
+# Data directory
+data/
+
+# Frontend (Node/React)
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+
+# Env & Secrets (全局)
+.env
+.env.local
+.env.*.local
+!.env.example
+!desktop/.env.development
+!desktop/.env.production
+!frontend/.env.development
+!frontend/.env.production
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+credentials*
+secrets*
+service-account*.json
+firebase-*.json
+google-services.json
+GoogleService-Info.plist
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Tauri updater temp keys
+desktop/.tmp-updater.key
+desktop/.tmp-updater.key.pub
+
+# General
+*.log
+*.dmg
+temp/
+tmp/
+templates_cache.json
+templates_cache.json.meta
+开发进度.md
+完整技术方案_精简融合版.md
+Tauri 桌面端软件开发方案.md
+frontend/前后端API对接文档.md
+frontend/_temp_hold/
+backend/前后端对接文档.md
+# Tauri Binaries
+desktop/src-tauri/binaries/
+desktop/src-tauri/bin/
+desktop/src-tauri/gen/
+desktop/src-tauri/target/
+desktop/src-tauri/*-apple-darwin
+desktop/src-tauri/*-pc-windows-msvc.exe
+desktop/src-tauri/*.app
+desktop/src-tauri/*.dmg
+desktop/src-tauri/*.tar.gz
+desktop/bin/
+backend/server
+backend/main
+backend/desktop/src-tauri/bin/
+*.png
+!assets/*.png
+!desktop/src-tauri/icons/*.png
+!desktop/src/assets/app-icon.png
+desktop/node_modules/
+desktop/dist/
+
+# Templates and local configs
+templates.json
+templates_nano_banana_pro.json
+TEMPLATE_MARKET_PLAN.md
+.sisyphus/
+.codex/
+.worktrees/

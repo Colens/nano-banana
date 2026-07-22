@@ -1,0 +1,69 @@
+package model
+
+import (
+	"time"
+
+	"gorm.io/gorm"
+)
+
+// ProviderConfig 对应 provider_configs 表，用于存储不同图片生成 API 的配置
+type ProviderConfig struct {
+	ID             uint           `gorm:"primaryKey" json:"id"`
+	ProviderName   string         `gorm:"uniqueIndex;not null" json:"provider_name"` // e.g., 'gemini', 'stable-diffusion'
+	DisplayName    string         `json:"display_name"`                              // e.g., 'Google Gemini'
+	APIBase        string         `json:"api_base"`                                  // API 基础 URL
+	APIKey         string         `json:"api_key"`                                   // API 密钥
+	Models         string         `json:"models"`                                    // 模型列表 JSON
+	Enabled        bool           `gorm:"default:true" json:"enabled"`               // 是否启用
+	TimeoutSeconds int            `gorm:"default:150" json:"timeout_seconds"`        // 超时时间
+	MaxRetries     int            `gorm:"default:1" json:"max_retries"`              // 最大重试次数
+	ExtraConfig    string         `json:"extra_config"`                              // 额外配置 JSON
+	CreatedAt      time.Time      `json:"created_at"`
+	UpdatedAt      time.Time      `json:"updated_at"`
+	DeletedAt      gorm.DeletedAt `gorm:"index" json:"-"`
+}
+
+// Task 对应 tasks 表，用于存储生成任务的状态和结果
+type Task struct {
+	ID                  uint           `gorm:"primaryKey" json:"id"`
+	TaskID              string         `gorm:"uniqueIndex;not null" json:"task_id"`              // 外部调用的唯一 ID
+	Prompt              string         `gorm:"index:idx_prompt_search;index" json:"prompt"`      // 提示词，添加复合索引支持搜索
+	PromptOriginal      string         `json:"prompt_original"`                                  // 用户原始输入的提示词
+	PromptOptimized     string         `json:"prompt_optimized"`                                 // 自动优化后的提示词
+	PromptOptimizeMode  string         `json:"prompt_optimize_mode"`                             // 自动优化模式：off/text/json
+	FolderID            string         `gorm:"index" json:"folder_id"`                           // 所属文件夹 ID（可选）
+	ProviderName        string         `gorm:"index" json:"provider_name"`                       // 使用的 Provider
+	ModelID             string         `gorm:"index" json:"model_id"`                            // 使用的模型 ID
+	Status              string         `gorm:"index:idx_status_created;not null" json:"status"`  // 状态，与创建时间组成复合索引
+	ErrorMessage        string         `json:"error_message"`                                    // 错误信息
+	ErrorRawMessage     string         `gorm:"-" json:"error_raw_message,omitempty"`             // 原始错误信息（仅接口返回）
+	ErrorCode           string         `gorm:"-" json:"error_code,omitempty"`                    // 结构化错误码（仅接口返回）
+	ErrorCategory       string         `gorm:"-" json:"error_category,omitempty"`                // 错误分类（仅接口返回）
+	ErrorRequestID      string         `gorm:"-" json:"error_request_id,omitempty"`              // 上游请求ID（仅接口返回）
+	ErrorRetryable      bool           `gorm:"-" json:"error_retryable,omitempty"`               // 是否建议重试（仅接口返回）
+	ErrorDetail         string         `gorm:"-" json:"error_detail,omitempty"`                  // 补充说明（仅接口返回）
+	ImageURL            string         `json:"image_url"`                                        // OSS 访问地址
+	LocalPath           string         `json:"local_path"`                                       // 本地存储路径
+	ThumbnailURL        string         `json:"thumbnail_url"`                                    // 缩略图 OSS 访问地址
+	ThumbnailPath       string         `json:"thumbnail_path"`                                   // 缩略图本地存储路径
+	Width               int            `json:"width"`                                            // 图片宽度
+	Height              int            `json:"height"`                                           // 图片高度
+	TotalCount          int            `gorm:"default:1" json:"total_count"`                     // 申请生成的数量
+	ConfigSnapshot      string         `json:"config_snapshot"`                                  // 生成时的配置快照
+	CreatedAt           time.Time      `gorm:"index:idx_status_created;index" json:"created_at"` // 创建时间
+	ProcessingStartedAt *time.Time     `gorm:"index" json:"processing_started_at"`               // 实际开始处理时间（不含排队时间）
+	CompletedAt         *time.Time     `json:"completed_at"`
+	DeletedAt           gorm.DeletedAt `gorm:"index" json:"-"`
+}
+
+// Folder 对应 folders 表，用于存储相册文件夹信息
+type Folder struct {
+	ID        uint           `gorm:"primaryKey" json:"id"`
+	Name      string         `gorm:"not null" json:"name"` // 文件夹名称
+	Type      string         `gorm:"not null" json:"type"` // 文件夹类型：month（自动月份）或 manual（手动创建）
+	Year      int            `json:"year"`                 // 年份（仅 auto 类型）
+	Month     int            `json:"month"`                // 月份（仅 auto 类型）
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
+}

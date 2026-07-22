@@ -1,0 +1,496 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Check, AlertCircle, Loader2, Trash2, XCircle } from 'lucide-react';
+import { GeneratedImage } from '../../types';
+import { cn } from '../common/Button';
+import { formatDateTime } from '../../utils/date';
+import { useHistoryStore } from '../../store/historyStore';
+import { useInternalDragStore } from '../../store/internalDragStore';
+import { useTranslation } from 'react-i18next';
+import { formatAspectRatioLabel } from '../../utils/aspectRatio';
+import type { ImageOptions } from '../../types';
+
+interface ImageCardProps {
+  image: GeneratedImage;
+  selected: boolean;
+  onSelect: (id: string) => void;
+  onClick: (image: GeneratedImage) => void;
+}
+
+export const ImageCard = React.memo(function ImageCard({
+  image,
+  selected,
+  onSelect,
+  onClick
+}: ImageCardProps) {
+  const { t, i18n } = useTranslation();
+  const isFailed = image.status === 'failed';
+  const isPending = !isFailed && (image.status === 'pending' || !image.url);
+  const isSuccess = image.status === 'success' && Boolean(image.url);
+  const reserveSpaceForSelect = isPending || isSuccess;
+
+  const [elapsed, setElapsed] = useState('0.0');
+  const rafRef = useRef<number | null>(null);
+  const lastUpdateRef = useRef(0);
+
+  const [isDeleting, setIsDeleting] = React.useState(false);
+  const [showConfirm, setShowConfirm] = React.useState(false);
+  const [activeSource, setActiveSource] = useState<'thumbnail' | 'full'>('thumbnail');
+  const [loadError, setLoadError] = useState(false);
+  const [loadedSource, setLoadedSource] = useState<'thumbnail' | 'full' | null>(null);
+  const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
+  const startDrag = useInternalDragStore((s) => s.startDrag);
+
+  useEffect(() => {
+    setActiveSource('thumbnail');
+    setLoadError(false);
+    setLoadedSource(null);
+  }, [image.id, image.thumbnailUrl, image.url, image.filePath, image.thumbnailPath]);
+
+  useEffect(() => {
+    return () => {
+      if (confirmTimerRef.current) {
+        clearTimeout(confirmTimerRef.current);
+        confirmTimerRef.current = null;
+      }
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isPending) {
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      return;
+    }
+
+    const startMsRaw = Date.parse(image.createdAt || '');
+    const startMs = Number.isFinite(startMsRaw) ? startMsRaw : Date.now();
+    lastUpdateRef.current = 0;
+
+    const tick = () => {
+      const now = Date.now();
+      if (now - lastUpdateRef.current >= 100) {
+        lastUpdateRef.current = now;
+        setElapsed(((now - startMs) / 1000).toFixed(1));
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
+
+    return () => {
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, [isPending, image.createdAt, image.id]);
+
+  const handleCancelConfirm = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    setShowConfirm(false);
+  }, []);
+
+  const handleDelete = useCallback(async (e: React.MouseEvent) => {
+    e.stopPropagation();
+
+    if (showConfirm) {
+      setIsDeleting(true);
+      try {
+        await useHistoryStore.getState().deleteImage(image, { source: 'generate' });
+        setIsDeleting(false);
+        setShowConfirm(false);
+      } catch (error) {
+        console.error('Delete image failed:', error);
+        setIsDeleting(false);
+      }
+    } else {
+      setShowConfirm(true);
+      if (confirmTimerRef.current) {
+        clearTimeout(confirmTimerRef.current);
+      }
+      confirmTimerRef.current = setTimeout(() => setShowConfirm(false), 3000);
+    }
+  }, [showConfirm, image.id, image.taskId]);
+
+  const handleClick = useCallback(() => {
+    const lastDragEndAt = useInternalDragStore.getState().lastDragEndAt;
+    if (Date.now() - lastDragEndAt < 200) return;
+    if (isSuccess || isFailed) {
+      onClick(image);
+    }
+  }, [image, isSuccess, isFailed, onClick]);
+
+  const parsedOptions = useMemo<ImageOptions | null>(() => {
+    try {
+      if (!image.options) return null;
+      return typeof image.options === 'string'
+        ? JSON.parse(image.options)
+        : image.options;
+    } catch {
+      return null;
+    }
+  }, [image.options]);
+
+  const meta = useMemo(() => {
+    const w = image.width || 0;
+    const h = image.height || 0;
+
+    const resolutionLabel = (() => {
+      const imageSize = String(parsedOptions?.imageSize || '').trim();
+      if (imageSize) return imageSize.toUpperCase();
+
+      const max = Math.max(w, h);
+      if (max >= 3840) return '4K';
+      if (max >= 2048) return '2K';
+      if (max >= 1024) return '1K';
+      return max > 0 ? 'SD' : '—';
+    })();
+
+    const aspectRatioLabel = (() => {
+      const optionAspectRatio = String(parsedOptions?.aspectRatio || '').trim();
+      if (optionAspectRatio) return optionAspectRatio;
+
+      if (w > 0 && h > 0) {
+        return formatAspectRatioLabel(w, h);
+      }
+
+      return '—';
+    })();
+
+    const timeLabel = (() => {
+      if (!image.createdAt) return '—';
+      try {
+        const d = new Date(image.createdAt);
+        if (Number.isNaN(d.getTime())) return '—';
+        return d.toLocaleTimeString(i18n.language, { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      } catch {
+        return '—';
+      }
+    })();
+
+    return { resolutionLabel, aspectRatioLabel, timeLabel };
+  }, [image.width, image.height, image.createdAt, parsedOptions, i18n.language]);
+
+  const imageSources = useMemo(() => {
+    const thumbnail = image.thumbnailUrl || '';
+    const full = image.url || '';
+    const preferred = activeSource === 'thumbnail' ? thumbnail : full;
+    const fallback = activeSource === 'thumbnail' ? full : '';
+    const primary = preferred || fallback;
+    const currentSource = preferred
+      ? activeSource
+      : fallback
+        ? 'full'
+        : null;
+    const hasRenderableSource = Boolean(primary);
+    return { thumbnail, full, primary, currentSource, hasRenderableSource };
+  }, [image.thumbnailUrl, image.url, activeSource]);
+
+  const shouldRenderImage = isSuccess && imageSources.hasRenderableSource && !loadError;
+
+  const handlePointerDown = useCallback((e: React.PointerEvent) => {
+    if (!isSuccess || e.button !== 0) return;
+    const target = e.target as HTMLElement | null;
+    if (target?.closest('button')) return;
+
+    // 从实际文件路径提取后缀，默认 .png
+    const getSourceExt = () => {
+      const sources = [image.filePath, image.thumbnailPath, image.url, image.thumbnailUrl];
+      for (const src of sources) {
+        if (src) {
+          const match = src.match(/\.(png|jpg|jpeg|gif|webp)$/i);
+          if (match) return match[0].toLowerCase();
+        }
+      }
+      return '.png';
+    };
+    const ext = getSourceExt();
+    const name = `ref-${image.id || 'unknown'}${ext}`;
+    const url = image.url || image.thumbnailUrl || '';
+    const thumbnailUrl = image.thumbnailUrl || image.url || '';
+    const filePath = image.filePath || '';
+    const thumbnailPath = image.thumbnailPath || '';
+    const hasSource = Boolean(url || thumbnailUrl || filePath || thumbnailPath);
+    if (!hasSource) return;
+
+    const fetchBlobFromSource = async (src: string) => {
+      if (!src) return null;
+      try {
+        const response = await fetch(src);
+        if (!response.ok) return null;
+        return await response.blob();
+      } catch {
+        return null;
+      }
+    };
+
+    const getBlob = async () => {
+      const preferredSources = loadedSource === 'full'
+        ? [url, filePath, thumbnailUrl, thumbnailPath]
+        : [thumbnailUrl, thumbnailPath, url, filePath];
+
+      for (const src of preferredSources) {
+        const blob = await fetchBlobFromSource(src);
+        if (blob) return blob;
+      }
+
+      const img = imgRef.current;
+      if (!img || !img.complete || img.naturalWidth <= 0 || img.naturalHeight <= 0) {
+        return null;
+      }
+
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return null;
+        ctx.drawImage(img, 0, 0);
+        return await new Promise<Blob | null>((resolve) => {
+          canvas.toBlob((blob) => resolve(blob || null), 'image/png');
+        });
+      } catch {
+        return null;
+      }
+    };
+
+    startDrag(
+      {
+        id: image.id,
+        name,
+        url,
+        thumbnailUrl,
+        filePath,
+        thumbnailPath,
+        getBlob
+      },
+      e.pointerId,
+      e.clientX,
+      e.clientY
+    );
+  }, [image.id, image.url, image.thumbnailUrl, image.filePath, image.thumbnailPath, isSuccess, startDrag, loadedSource]);
+
+  return (
+    <div
+      className={cn(
+        "group relative bg-white rounded-xl overflow-hidden border border-gray-100 shadow-sm transition-all duration-300 cursor-pointer flex flex-col h-full",
+        selected ? "ring-2 ring-blue-500 shadow-lg shadow-blue-100/50 scale-[0.98]" : "hover:shadow-md hover:-translate-y-0.5"
+      )}
+      style={{ contentVisibility: 'auto', containIntrinsicSize: '240px 320px' }}
+      onClick={handleClick}
+      onPointerDown={handlePointerDown}
+    >
+      {/* 图片/加载区域 - 统一正方形 */}
+      <div className={cn(
+        "relative w-full aspect-square overflow-hidden transition-colors duration-500",
+        isPending ? "bg-blue-50/50" : "bg-slate-50"
+      )}>
+        {/* 删除按钮 - 纯 CSS hover，不依赖 JavaScript */}
+        {!showConfirm && (
+          <div
+            className={cn(
+              "absolute top-2 z-40 transition-opacity duration-100 ease-out opacity-0 group-hover:opacity-100 pointer-events-none",
+              reserveSpaceForSelect ? "right-10" : "right-2"
+            )}
+          >
+            <button
+              onClick={handleDelete}
+              disabled={isDeleting}
+              className={cn(
+                "rounded-full flex items-center justify-center shadow-lg transition-all duration-200 bg-red-500 hover:bg-red-600 text-white w-7 h-7 sm:w-8 sm:h-8 pointer-events-auto",
+                isDeleting ? "opacity-50 cursor-not-allowed" : ""
+              )}
+              title={t('generate.card.deleteTitle')}
+            >
+              {isDeleting ? (
+                <div className="w-3 h-3 sm:w-4 sm:h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+              ) : (
+                <Trash2 className="w-3 h-3 sm:w-4 sm:h-4" />
+              )}
+            </button>
+          </div>
+        )}
+
+        {/* 确认删除 */}
+        {showConfirm && (
+          <div className="absolute top-2 right-2 z-40 flex items-center gap-2 pointer-events-none">
+            <button
+              onClick={handleCancelConfirm}
+              className="bg-slate-500 text-white w-8 h-8 rounded-full flex items-center justify-center hover:bg-slate-600 transition-colors shadow-lg pointer-events-auto"
+              title={t('common.cancel')}
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+            <button
+              onClick={handleDelete}
+              disabled={isDeleting}
+              className={cn(
+                "rounded-full flex items-center justify-center shadow-lg transition-all duration-200 bg-red-600 text-white w-auto px-3 h-8 pointer-events-auto",
+                isDeleting ? "opacity-50 cursor-not-allowed" : ""
+              )}
+              title={t('generate.card.confirmDeleteTitle')}
+            >
+              {isDeleting ? (
+                <div className="w-3 h-3 sm:w-4 sm:h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+              ) : (
+                <span className="text-xs font-bold">{t('generate.card.confirmLabel')}</span>
+              )}
+            </button>
+          </div>
+        )}
+
+        {isPending ? (
+          <div className="w-full h-full flex flex-col items-center justify-center relative p-4 bg-blue-50/30">
+            {/* 加载动画 - 强化版 */}
+            <div className="relative mb-4 flex items-center justify-center">
+              <div className="absolute w-16 h-16 bg-blue-500/10 rounded-full animate-ping" />
+              <div className="absolute w-12 h-12 border-2 border-blue-100 rounded-full" />
+              <div className="absolute w-12 h-12 border-t-2 border-blue-500 rounded-full animate-spin" />
+              <Loader2 className="w-6 h-6 text-blue-500 animate-pulse relative z-10" />
+            </div>
+
+            <div className="flex flex-col items-center gap-2">
+              <div className="flex items-center gap-2">
+                <div className="flex gap-0.5">
+                  <div className="w-1 h-1 bg-blue-400 rounded-full animate-bounce [animation-delay:-0.3s]" />
+                  <div className="w-1 h-1 bg-blue-500 rounded-full animate-bounce [animation-delay:-0.15s]" />
+                  <div className="w-1 h-1 bg-blue-600 rounded-full animate-bounce" />
+                </div>
+                <span className="text-sm font-bold text-blue-600 tracking-tight">{t('generate.card.generating')}</span>
+              </div>
+              <div className="flex items-center gap-1.5 px-2 py-0.5 bg-blue-100/50 rounded-full border border-blue-200/50">
+                <span className="text-[10px] font-bold font-mono text-blue-500 tabular-nums">
+                  {elapsed}s
+                </span>
+              </div>
+            </div>
+
+            {/* 选择框 (正在生成时也可以选择) */}
+            {!showConfirm && (
+              <div
+                className="absolute top-2 right-2 z-30"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onSelect(image.id);
+                }}
+              >
+                <div className={cn(
+                  "w-5 h-5 rounded-full border-2 transition-all flex items-center justify-center",
+                  selected
+                    ? "bg-blue-500 border-blue-500 text-white"
+                    : "bg-black/10 border-white/40 text-transparent hover:border-white"
+                )}>
+                  <Check className="w-3 h-3" />
+                </div>
+              </div>
+            )}
+          </div>
+        ) : shouldRenderImage ? (
+          <div className="w-full h-full relative">
+            <img
+              ref={imgRef}
+              src={imageSources.primary}
+              alt={image.prompt || t('generate.card.imageAlt')}
+              className="w-full h-full object-cover"
+              loading="lazy"
+              decoding="async"
+              draggable={false}
+              onLoad={() => {
+                setLoadError(false);
+                setLoadedSource(imageSources.currentSource);
+              }}
+              onError={(event) => {
+                const currentSrc = (event.currentTarget.getAttribute('src') || '').trim();
+                if (
+                  activeSource === 'thumbnail' &&
+                  image.thumbnailUrl &&
+                  currentSrc === image.thumbnailUrl &&
+                  imageSources.full
+                ) {
+                  setActiveSource('full');
+                  setLoadedSource(null);
+                  return;
+                }
+                setLoadError(true);
+                console.warn('[ImageCard] image load failed', {
+                  id: image.id,
+                  thumbnailUrl: image.thumbnailUrl,
+                  url: image.url,
+                  filePath: image.filePath,
+                  thumbnailPath: image.thumbnailPath
+                });
+              }}
+            />
+            
+            {/* 渐变遮罩 - 仅在悬浮时显示更多信息 */}
+            <div className="absolute inset-0 bg-black/0 group-hover:bg-black/20 transition-all duration-300 pointer-events-none" />
+
+            {/* 选择框 */}
+            {!showConfirm && (
+              <div
+                className={cn(
+                  "absolute top-2 right-2 z-30 transition-all duration-300",
+                  selected ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                )}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onSelect(image.id);
+                }}
+              >
+                <div className={cn(
+                  "w-5 h-5 rounded-full border-2 transition-all flex items-center justify-center",
+                  selected
+                    ? "bg-blue-500 border-blue-500 text-white"
+                    : "bg-black/10 border-white/40 text-transparent hover:border-white"
+                )}>
+                  <Check className="w-3 h-3" />
+                </div>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="w-full h-full flex flex-col items-center justify-center bg-red-50/50 p-4 transition-colors duration-500">
+            <div className="relative mb-3">
+              <div className="absolute inset-0 bg-red-500/10 rounded-full animate-pulse" />
+              <XCircle className="w-10 h-10 text-red-400 relative z-10" />
+            </div>
+            <span className="text-sm font-bold text-red-500 tracking-tight">
+              {isFailed ? t('generate.card.failed') : t('generate.preview.loadError')}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* 信息区域 - 保持与历史区一致的样式 */}
+      <div className="p-2 sm:p-3 flex flex-col gap-1.5 sm:gap-2 flex-shrink-0 bg-white">
+        <p className="text-[10px] sm:text-xs text-gray-800 line-clamp-2 font-medium leading-relaxed h-8 sm:h-9" title={image.prompt}>
+          {image.prompt || t('generate.card.emptyPrompt')}
+        </p>
+
+        <div className="flex items-center justify-between text-[8px] sm:text-[9px] text-gray-400 pt-1 border-t border-gray-50 mt-auto">
+          <span className="font-mono tabular-nums">
+            <span className="sm:hidden">{meta.timeLabel}</span>
+            <span className="hidden sm:inline">{formatDateTime(image.createdAt)}</span>
+          </span>
+          <div className="flex items-center gap-1">
+            <span className="bg-blue-50 text-blue-600 px-1 py-0.5 rounded font-black tracking-tighter border border-blue-100/50">
+              {meta.resolutionLabel}
+            </span>
+            <span className="bg-slate-100 text-slate-500 px-1 py-0.5 rounded font-bold tracking-tighter border border-slate-200/50">
+              {meta.aspectRatioLabel}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+});

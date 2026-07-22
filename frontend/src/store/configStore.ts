@@ -1,0 +1,284 @@
+import { create } from 'zustand';
+import { persist, createJSONStorage } from 'zustand/middleware';
+import type { PersistedRefImage } from '../types';
+
+// Model constants to avoid magic strings
+export const IMAGE_MODELS = {
+  FLASH: { value: 'gemini-3-flash-image-preview', label: 'Flash' },
+  PRO: { value: 'gemini-3-pro-image-preview', label: 'Pro' },
+} as const;
+
+// Model options for the dropdown selectors
+export const IMAGE_MODEL_OPTIONS = [
+  { value: IMAGE_MODELS.FLASH.value, label: `${IMAGE_MODELS.FLASH.label} (${IMAGE_MODELS.FLASH.value})` },
+  { value: IMAGE_MODELS.PRO.value, label: `${IMAGE_MODELS.PRO.label} (${IMAGE_MODELS.PRO.value})` },
+] as const;
+
+export const CUSTOM_MODEL_VALUE = '__custom__';
+
+// Model configuration with supported aspect ratios
+export const IMAGE_MODEL_CONFIG: Record<string, { aspectRatios: string[] }> = {
+  [IMAGE_MODELS.FLASH.value]: {
+    aspectRatios: ['1:1', '1:4', '1:8', '2:3', '3:2', '3:4', '4:1', '4:3', '4:5', '5:4', '8:1', '9:16', '16:9', '21:9']
+  },
+  [IMAGE_MODELS.PRO.value]: {
+    aspectRatios: ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9']
+  }
+};
+
+// Helper function to get supported aspect ratios for a model
+export const getModelAspectRatios = (model: string): string[] => {
+  const ratios = IMAGE_MODEL_CONFIG[model]?.aspectRatios;
+  return (ratios && ratios.length > 0) ? ratios : ['1:1'];
+};
+
+interface ConfigState {
+  // 生图配置
+  imageProvider: string;
+  imageApiBaseUrl: string;
+  imageApiKey: string;
+  imageModel: string;
+  imageTimeoutSeconds: number;
+  // 识图配置（逆向提示词用）
+  visionProvider: string;
+  visionApiBaseUrl: string;
+  visionApiKey: string;
+  visionModel: string;
+  visionTimeoutSeconds: number;
+  visionSyncedConfig: {
+    apiBaseUrl: string;
+    apiKey: string;
+    model: string;
+    timeoutSeconds: number;
+  } | null;
+  enableRefImageCompression: boolean;
+
+  // 对话配置
+  chatProvider: string;
+  chatApiBaseUrl: string;
+  chatApiKey: string;
+  chatModel: string;
+  chatTimeoutSeconds: number;
+  chatSyncedConfig: {
+    apiBaseUrl: string;
+    apiKey: string;
+    model: string;
+    timeoutSeconds: number;
+  } | null;
+
+  language: string;
+  languageResolved: string | null;
+  
+  prompt: string;
+  count: number;
+  imageSize: string;
+  aspectRatio: string;
+  refFiles: File[];
+  refImageEntries: PersistedRefImage[];
+
+  setImageProvider: (provider: string) => void;
+  setImageApiBaseUrl: (url: string) => void;
+  setImageApiKey: (key: string) => void;
+  setImageModel: (model: string) => void;
+  setImageTimeoutSeconds: (seconds: number) => void;
+  setVisionProvider: (provider: string) => void;
+  setVisionApiBaseUrl: (url: string) => void;
+  setVisionApiKey: (key: string) => void;
+  setVisionModel: (model: string) => void;
+  setVisionTimeoutSeconds: (seconds: number) => void;
+  setVisionSyncedConfig: (config: { apiBaseUrl: string; apiKey: string; model: string; timeoutSeconds: number } | null) => void;
+  setEnableRefImageCompression: (enabled: boolean) => void;
+  setChatProvider: (provider: string) => void;
+  setChatApiBaseUrl: (url: string) => void;
+  setChatApiKey: (key: string) => void;
+  setChatModel: (model: string) => void;
+  setChatTimeoutSeconds: (seconds: number) => void;
+  setChatSyncedConfig: (config: { apiBaseUrl: string; apiKey: string; model: string; timeoutSeconds: number } | null) => void;
+  setLanguage: (language: string) => void;
+  setLanguageResolved: (languageResolved: string | null) => void;
+  setPrompt: (prompt: string) => void;
+  setCount: (count: number) => void;
+  setImageSize: (size: string) => void;
+  setAspectRatio: (ratio: string) => void;
+  setRefFiles: (files: File[]) => void;
+  addRefFiles: (files: File[]) => void;
+  removeRefFile: (index: number) => void;
+  clearRefFiles: () => void;
+  setRefImageEntries: (entries: PersistedRefImage[]) => void;
+
+  reset: () => void;
+}
+
+export const useConfigStore = create<ConfigState>()(
+  persist(
+    (set) => ({
+      imageProvider: 'gemini',
+      imageApiBaseUrl: 'https://generativelanguage.googleapis.com',
+      imageApiKey: '',
+      imageModel: 'gemini-3-flash-image-preview',
+      imageTimeoutSeconds: 500,
+      // 识图配置（逆向提示词用）
+      visionProvider: 'gemini-chat',
+      visionApiBaseUrl: '',
+      visionApiKey: '',
+      visionModel: 'gemini-3-flash-preview',
+      visionTimeoutSeconds: 150,
+      visionSyncedConfig: null,
+      enableRefImageCompression: true,
+      chatProvider: 'openai-chat',
+      chatApiBaseUrl: 'https://api.openai.com/v1',
+      chatApiKey: '',
+      chatModel: 'gemini-3-flash-preview',
+      chatTimeoutSeconds: 150,
+      chatSyncedConfig: null,
+      language: 'system',
+      languageResolved: null,
+      prompt: '',
+      count: 1,
+      imageSize: '2K',
+      aspectRatio: '1:1',
+      refFiles: [],
+      refImageEntries: [],
+
+      setImageProvider: (imageProvider) => set({ imageProvider }),
+      setImageApiBaseUrl: (imageApiBaseUrl) => set({ imageApiBaseUrl }),
+      setImageApiKey: (imageApiKey) => set({ imageApiKey }),
+      setImageModel: (imageModel) => set({ imageModel }),
+      setImageTimeoutSeconds: (imageTimeoutSeconds) => set({ imageTimeoutSeconds }),
+      setVisionProvider: (visionProvider) => set({ visionProvider }),
+      setVisionApiBaseUrl: (visionApiBaseUrl) => set({ visionApiBaseUrl }),
+      setVisionApiKey: (visionApiKey) => set({ visionApiKey }),
+      setVisionModel: (visionModel) => set({ visionModel }),
+      setVisionTimeoutSeconds: (visionTimeoutSeconds) => set({ visionTimeoutSeconds }),
+      setVisionSyncedConfig: (visionSyncedConfig) => set({ visionSyncedConfig }),
+      setEnableRefImageCompression: (enableRefImageCompression) => set({ enableRefImageCompression }),
+      setChatProvider: (chatProvider) => set({ chatProvider }),
+      setChatApiBaseUrl: (chatApiBaseUrl) => set({ chatApiBaseUrl }),
+      setChatApiKey: (chatApiKey) => set({ chatApiKey }),
+      setChatModel: (chatModel) => set({ chatModel }),
+      setChatTimeoutSeconds: (chatTimeoutSeconds) => set({ chatTimeoutSeconds }),
+      setChatSyncedConfig: (chatSyncedConfig) => set({ chatSyncedConfig }),
+      setLanguage: (language) => set({ language }),
+      setLanguageResolved: (languageResolved) => set({ languageResolved }),
+      setPrompt: (prompt) => set({ prompt }),
+      setCount: (count) => set({ count }),
+      setImageSize: (imageSize) => set({ imageSize }),
+      setAspectRatio: (aspectRatio) => set({ aspectRatio }),
+      setRefFiles: (refFiles) => set({ refFiles }),
+      setRefImageEntries: (refImageEntries) => set({ refImageEntries }),
+
+      addRefFiles: (files) => set((state) => ({
+          // 限制最多 10 张
+          refFiles: [...state.refFiles, ...files].slice(0, 10)
+      })),
+
+      removeRefFile: (index) => set((state) => ({
+          refFiles: state.refFiles.filter((_, i) => i !== index)
+      })),
+
+      clearRefFiles: () => set({ refFiles: [] }),
+
+      reset: () => set({
+        imageApiBaseUrl: 'https://generativelanguage.googleapis.com',
+        imageModel: 'gemini-3-flash-image-preview',
+        imageTimeoutSeconds: 500,
+      // 识图配置（逆向提示词用）
+      visionProvider: 'gemini-chat',
+      visionApiBaseUrl: '',
+      visionApiKey: '',
+      visionModel: 'gemini-3-flash-preview',
+      visionTimeoutSeconds: 150,
+      visionSyncedConfig: null,
+        chatProvider: 'openai-chat',
+        chatApiBaseUrl: 'https://api.openai.com/v1',
+        chatModel: 'gemini-3-flash-preview',
+        chatTimeoutSeconds: 150,
+        chatSyncedConfig: null,
+        prompt: '',
+        count: 1,
+        imageSize: '2K',
+        aspectRatio: '1:1',
+        refFiles: [],
+        refImageEntries: [],
+      })
+    }),
+    {
+      name: 'app-config-storage',
+      storage: createJSONStorage(() => localStorage),
+      version: 10,
+      // 关键：不要将 File 对象序列化到 localStorage（File 对象无法序列化）
+      partialize: (state) => {
+          const { refFiles, ...rest } = state;
+          return rest;
+      },
+      migrate: (persistedState, version) => {
+        const state = persistedState as any;
+        let next = state;
+        if (version < 2) {
+          next = {
+            ...state,
+            imageProvider: state.imageProvider ?? state.provider ?? 'gemini',
+            imageApiBaseUrl: state.imageApiBaseUrl ?? state.apiBaseUrl ?? 'https://generativelanguage.googleapis.com',
+            imageApiKey: state.imageApiKey ?? state.apiKey ?? '',
+            imageModel: state.imageModel ?? state.model ?? 'gemini-3-flash-image-preview',
+            chatApiBaseUrl: state.chatApiBaseUrl ?? 'https://api.openai.com/v1',
+            chatApiKey: state.chatApiKey ?? '',
+            chatModel: state.chatModel ?? state.textModel ?? '',
+          };
+        }
+        if (version < 3) {
+          const chatKey = String(next.chatApiKey ?? '').trim();
+          const chatModel = String(next.chatModel ?? '').trim();
+          const shouldDefault = !chatKey && (chatModel === '' || chatModel === 'gpt-4o-mini');
+          if (shouldDefault) {
+            next = { ...next, chatModel: 'gemini-3-flash-preview' };
+          }
+        }
+        if (version < 4) {
+          next = { ...next, chatSyncedConfig: next.chatSyncedConfig ?? null };
+        }
+        if (version < 5) {
+          const base = String(next.chatApiBaseUrl ?? '').toLowerCase();
+          const model = String(next.chatModel ?? '').toLowerCase();
+          const inferred = base.includes('generativelanguage') || model.startsWith('gemini')
+            ? 'gemini-chat'
+            : 'openai-chat';
+          next = { ...next, chatProvider: next.chatProvider ?? inferred };
+        }
+        if (version < 6) {
+          next = { ...next, refImageEntries: next.refImageEntries ?? [] };
+        }
+        if (version < 7) {
+          next = { ...next, language: next.language ?? '' };
+        }
+        if (version < 8) {
+          const rawLanguage = typeof next.language === 'string' ? next.language.trim() : '';
+          next = {
+            ...next,
+            language: rawLanguage ? next.language : 'system',
+            languageResolved: next.languageResolved ?? null
+          };
+        }
+        if (version < 9) {
+          next = {
+            ...next,
+            imageTimeoutSeconds: next.imageTimeoutSeconds ?? 500,
+            chatTimeoutSeconds: next.chatTimeoutSeconds ?? 150
+          };
+          if (next.chatSyncedConfig && next.chatSyncedConfig.timeoutSeconds == null) {
+            next = {
+              ...next,
+              chatSyncedConfig: {
+                ...next.chatSyncedConfig,
+                timeoutSeconds: next.chatTimeoutSeconds ?? 150
+              }
+            };
+          }
+        }
+
+
+        return next;
+      },
+    }
+  )
+);

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>大香蕉图片生成工具</title>
+    <!-- 首屏兜底：避免 WebView 初始化时白屏闪烁 -->
+    <style>
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: #f8fafc;
+      }
+      #root { height: 100%; }
+      #boot {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #f8fafc;
+        color: #0f172a;
+        user-select: none;
+      }
+      #boot .boot-wrap { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+      #boot .boot-logo {
+        width: 56px;
+        height: 56px;
+        border-radius: 18px;
+        background: linear-gradient(135deg, #2563eb, #4f46e5);
+        box-shadow: 0 12px 30px rgba(37,99,235,.18);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 800;
+        font-size: 22px;
+        color: #fff;
+        letter-spacing: -0.04em;
+      }
+      #boot .boot-row { display: flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 700; color: rgba(15,23,42,.55); }
+      #boot .boot-spinner {
+        width: 14px;
+        height: 14px;
+        border-radius: 999px;
+        border: 2px solid rgba(37,99,235,.18);
+        border-top-color: #2563eb;
+        animation: boot-spin .9s linear infinite;
+      }
+      @keyframes boot-spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <div id="boot" data-tauri-drag-region>
+      <div class="boot-wrap">
+        <div class="boot-logo">B</div>
+        <div class="boot-row">
+          <span class="boot-spinner"></span>
+          <span>正在启动…</span>
+        </div>
+      </div>
+    </div>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

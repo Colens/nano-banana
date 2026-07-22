@@ -1,0 +1,79 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "大香蕉 AI",
+  "version": "2.8.4",
+  "identifier": "com.dztool.banana",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "大香蕉 AI",
+        "width": 1200,
+        "height": 800,
+        "transparent": true,
+        "titleBarStyle": "Overlay"
+      }
+    ],
+    "security": {
+      "csp": {
+        "default-src": "'self' asset:",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' asset: http://asset.localhost https://asset.localhost blob: data: http: https: tauri: ipc:",
+        "connect-src": "'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* http: https:",
+        "font-src": "'self' data:",
+        "worker-src": "'self' blob:",
+        "media-src": "'self' asset: blob: data:",
+        "object-src": "'none'",
+        "base-uri": "'self'",
+        "frame-ancestors": "'none'"
+      },
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$APPDATA/**",
+          "$APPCONFIG/**",
+          "$APPCACHE/**",
+          "$TEMP/**"
+        ]
+      },
+      "capabilities": [
+        "default"
+      ]
+    }
+  },
+  "bundle": {
+      "active": true,
+      "targets": "all",
+      "createUpdaterArtifacts": true,
+      "macOS": {
+        "entitlements": "Entitlements.plist"
+      },
+      "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "bin/server"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI5MDg4OUIyMTU0MDU2MTYKUldRV1ZrQVZzb2tJS1JlUENUMmRUMEZVQTRIWWRCRjdHVkhFWVlVK3lvTnRuWmhSNXE0Q201WGMK",
+      "endpoints": [
+        "https://github.com/ShellMonster/Nano_Banana_Pro_Web/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

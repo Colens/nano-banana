@@ -1,0 +1,1197 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+
+	"image-gen-service/internal/config"
+	"image-gen-service/internal/diagnostic"
+	"image-gen-service/internal/model"
+	"image-gen-service/internal/platform"
+	"image-gen-service/internal/promptopt"
+	"image-gen-service/internal/provider"
+	"image-gen-service/internal/storage"
+	"image-gen-service/internal/worker"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+// Response 统一 API 响应结构
+type Response struct {
+	Code    int         `json:"code"`    // 业务状态码: 200 为成功，其他为失败
+	Message string      `json:"message"` // 提示信息
+	Data    interface{} `json:"data"`    // 返回数据
+}
+
+// Success 成功响应
+func Success(c *gin.Context, data interface{}) {
+	c.JSON(http.StatusOK, Response{
+		Code:    200,
+		Message: "success",
+		Data:    data,
+	})
+}
+
+// Error 错误响应
+func Error(c *gin.Context, httpStatus int, code int, message string) {
+	c.JSON(httpStatus, Response{
+		Code:    code,
+		Message: message,
+		Data:    nil,
+	})
+}
+
+// GenerateRequest 生成图片请求参数
+type GenerateRequest struct {
+	Provider string                 `json:"provider" binding:"required"`
+	ModelID  string                 `json:"model_id"`
+	Params   map[string]interface{} `json:"params"`
+}
+
+func sanitizeTaskImagePaths(task *model.Task) {
+	if task == nil {
+		return
+	}
+	task.LocalPath = toPublicImagePath(task.LocalPath)
+	task.ThumbnailPath = toPublicImagePath(task.ThumbnailPath)
+}
+
+func sanitizeTaskImagePathsBatch(tasks []model.Task) {
+	for i := range tasks {
+		sanitizeTaskImagePaths(&tasks[i])
+	}
+}
+
+func buildConfigSnapshot(providerName, modelID string, params map[string]interface{}) string {
+	if params == nil {
+		params = map[string]interface{}{}
+	}
+
+	snapshot := map[string]interface{}{
+		"provider": providerName,
+	}
+	if modelID != "" {
+		snapshot["model_id"] = modelID
+	}
+
+	// 兼容多种 key 命名（前端/后端/历史版本）
+	if v, ok := params["aspectRatio"].(string); ok && v != "" {
+		snapshot["aspectRatio"] = v
+	} else if v, ok := params["aspect_ratio"].(string); ok && v != "" {
+		snapshot["aspectRatio"] = v
+	} else if v, ok := params["aspect"].(string); ok && v != "" {
+		snapshot["aspectRatio"] = v
+	}
+
+	if v, ok := params["imageSize"].(string); ok && v != "" {
+		snapshot["imageSize"] = v
+	} else if v, ok := params["resolution_level"].(string); ok && v != "" {
+		snapshot["imageSize"] = v
+	} else if v, ok := params["image_size"].(string); ok && v != "" {
+		snapshot["imageSize"] = v
+	}
+	if v, ok := params["size"].(string); ok && strings.TrimSpace(v) != "" {
+		snapshot["size"] = strings.TrimSpace(v)
+	}
+	if v, ok := params["quality"].(string); ok && strings.TrimSpace(v) != "" {
+		snapshot["quality"] = strings.TrimSpace(v)
+	}
+
+	// count 可能是 float64（JSON 解析）或 int（服务内部）
+	if v, ok := params["count"].(int); ok && v > 0 {
+		snapshot["count"] = v
+	} else if v, ok := params["count"].(float64); ok && v > 0 {
+		snapshot["count"] = int(v)
+	}
+	if v, ok := params["prompt_optimize_mode"].(string); ok && strings.TrimSpace(v) != "" && strings.TrimSpace(v) != promptopt.ModeOff {
+		snapshot["promptOptimizeMode"] = strings.TrimSpace(v)
+	}
+
+	b, err := json.Marshal(snapshot)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func fetchProviderConfig(providerName string) *model.ProviderConfig {
+	if model.DB == nil {
+		return nil
+	}
+	var cfg model.ProviderConfig
+	if err := model.DB.Where("provider_name = ?", providerName).First(&cfg).Error; err != nil {
+		return nil
+	}
+	return &cfg
+}
+
+func defaultTimeoutSecondsForProvider(providerName string) int {
+	switch providerName {
+	case "gemini", "openai", "openai-image", "cobaba":
+		return 500
+	default:
+		return 150
+	}
+}
+
+func providerDefaultMaxRetries(providerName string) int {
+	switch providerName {
+	case "gemini", "openai", "openai-image", "cobaba":
+		return 1
+	default:
+		return 1
+	}
+}
+
+func normalizePathForCheck(path string) string {
+	cleaned := filepath.Clean(path)
+	cleaned = strings.TrimRight(cleaned, string(filepath.Separator))
+	if cleaned == "" {
+		return string(filepath.Separator)
+	}
+	return cleaned
+}
+
+func pathWithinRoot(path, root string) bool {
+	nPath := normalizePathForCheck(path)
+	nRoot := normalizePathForCheck(root)
+	if runtime.GOOS == "windows" {
+		nPath = strings.ToLower(nPath)
+		nRoot = strings.ToLower(nRoot)
+	}
+	if nPath == nRoot {
+		return true
+	}
+	rel, err := filepath.Rel(nRoot, nPath)
+	if err != nil {
+		return false
+	}
+	rel = strings.TrimSpace(rel)
+	if rel == "." {
+		return true
+	}
+	if rel == "" {
+		return false
+	}
+	return !strings.HasPrefix(rel, "..")
+}
+
+func allowedRefPathRoots() []string {
+	roots := make([]string, 0, 4)
+	if configDir, err := os.UserConfigDir(); err == nil && strings.TrimSpace(configDir) != "" {
+		roots = append(roots, filepath.Join(configDir, "com.dztool.banana"))
+	}
+	if cacheDir, err := os.UserCacheDir(); err == nil && strings.TrimSpace(cacheDir) != "" {
+		roots = append(roots, filepath.Join(cacheDir, "com.dztool.banana"))
+	}
+	roots = append(roots, os.TempDir())
+	return roots
+}
+
+func validateRefPathForTauri(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", fmt.Errorf("empty ref path")
+	}
+	if normalizedStorage := normalizeStoragePath(trimmed); normalizedStorage != "" {
+		if configDir, err := os.UserConfigDir(); err == nil && strings.TrimSpace(configDir) != "" {
+			candidate := filepath.Join(configDir, "com.dztool.banana", strings.TrimPrefix(normalizedStorage, "/"))
+			if info, err := os.Stat(candidate); err == nil {
+				if err := validateReferenceImageRegularFile(filepath.Base(candidate), info.Mode().IsRegular()); err != nil {
+					return "", err
+				}
+				if err := validateReferenceImageSize(filepath.Base(candidate), info.Size()); err != nil {
+					return "", err
+				}
+				return filepath.Clean(candidate), nil
+			}
+		}
+		if cacheDir, err := os.UserCacheDir(); err == nil && strings.TrimSpace(cacheDir) != "" {
+			candidate := filepath.Join(cacheDir, "com.dztool.banana", strings.TrimPrefix(normalizedStorage, "/"))
+			if info, err := os.Stat(candidate); err == nil {
+				if err := validateReferenceImageRegularFile(filepath.Base(candidate), info.Mode().IsRegular()); err != nil {
+					return "", err
+				}
+				if err := validateReferenceImageSize(filepath.Base(candidate), info.Size()); err != nil {
+					return "", err
+				}
+				return filepath.Clean(candidate), nil
+			}
+		}
+	}
+	abs, err := filepath.Abs(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("invalid ref path: %w", err)
+	}
+	abs = filepath.Clean(abs)
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("ref path could not be resolved: %w", err)
+	}
+	real := filepath.Clean(strings.TrimSpace(resolved))
+	if real == "" {
+		return "", fmt.Errorf("ref path could not be resolved")
+	}
+	for _, root := range allowedRefPathRoots() {
+		if pathWithinRoot(real, root) {
+			info, err := os.Stat(real)
+			if err != nil {
+				return "", fmt.Errorf("读取本地参考图失败: %w", err)
+			}
+			if err := validateReferenceImageRegularFile(filepath.Base(real), info.Mode().IsRegular()); err != nil {
+				return "", err
+			}
+			if err := validateReferenceImageSize(filepath.Base(real), info.Size()); err != nil {
+				return "", err
+			}
+			return real, nil
+		}
+	}
+	return "", fmt.Errorf("ref path is outside allowed directories")
+}
+
+// ProviderConfigRequest 设置 Provider 配置请求
+type ProviderConfigRequest struct {
+	ProviderName string `json:"provider_name" binding:"required"`
+	DisplayName  string `json:"display_name"`
+	APIBase      string `json:"api_base" binding:"required"`
+	APIKey       string `json:"api_key" binding:"required"`
+	Enabled      bool   `json:"enabled"`
+	ModelID      string `json:"model_id"`
+	TimeoutSecs  *int   `json:"timeout_seconds"`
+	MaxRetries   *int   `json:"max_retries"`
+}
+
+// UpdateProviderConfigHandler 更新 Provider 配置
+func UpdateProviderConfigHandler(c *gin.Context) {
+	var req ProviderConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("[API] UpdateProviderConfig 参数绑定失败: %v\n", err)
+		// 返回更具体的绑定错误信息
+		Error(c, http.StatusBadRequest, 400, "参数验证失败: "+err.Error())
+		return
+	}
+
+	log.Printf("[API] 收到配置更新请求: Provider=%s, Base=%s, KeyLen=%d\n",
+		req.ProviderName, req.APIBase, len(req.APIKey))
+
+	if model.DB == nil {
+		log.Printf("[API] 数据库未初始化\n")
+		Error(c, http.StatusInternalServerError, 500, "数据库未初始化")
+		return
+	}
+
+	var configData model.ProviderConfig
+	err := model.DB.Where("provider_name = ?", req.ProviderName).First(&configData).Error
+	if err != nil {
+		log.Printf("[API] 配置不存在，准备创建: %s\n", req.ProviderName)
+		// 不存在则创建
+		modelsJSON := buildModelsJSON(req.ProviderName, req.ModelID, "")
+		timeoutSeconds := defaultTimeoutSecondsForProvider(req.ProviderName)
+		if req.TimeoutSecs != nil && *req.TimeoutSecs > 0 {
+			timeoutSeconds = *req.TimeoutSecs
+		}
+		maxRetries := providerDefaultMaxRetries(req.ProviderName)
+		if req.MaxRetries != nil {
+			if *req.MaxRetries >= 0 {
+				maxRetries = *req.MaxRetries
+			}
+		}
+
+		configData = model.ProviderConfig{
+			ProviderName:   req.ProviderName,
+			DisplayName:    req.DisplayName,
+			APIBase:        req.APIBase,
+			APIKey:         req.APIKey,
+			Models:         modelsJSON,
+			Enabled:        req.Enabled,
+			TimeoutSeconds: timeoutSeconds,
+			MaxRetries:     maxRetries,
+		}
+		if err := model.DB.Create(&configData).Error; err != nil {
+			log.Printf("[API] 创建配置失败: %v\n", err)
+			Error(c, http.StatusInternalServerError, 500, "保存配置到数据库失败: "+err.Error())
+			return
+		}
+	} else {
+		log.Printf("[API] 配置已存在，准备更新: %s\n", req.ProviderName)
+		// 存在则更新
+		updates := map[string]interface{}{
+			"api_base": req.APIBase,
+			"api_key":  req.APIKey,
+			"enabled":  req.Enabled,
+		}
+		if req.DisplayName != "" {
+			updates["display_name"] = req.DisplayName
+		}
+		if modelsJSON := buildModelsJSON(req.ProviderName, req.ModelID, configData.Models); modelsJSON != "" {
+			updates["models"] = modelsJSON
+		}
+		if req.TimeoutSecs != nil {
+			if *req.TimeoutSecs > 0 {
+				updates["timeout_seconds"] = *req.TimeoutSecs
+			} else {
+				updates["timeout_seconds"] = defaultTimeoutSecondsForProvider(req.ProviderName)
+			}
+		}
+		if req.MaxRetries != nil {
+			if *req.MaxRetries >= 0 {
+				updates["max_retries"] = *req.MaxRetries
+			} else {
+				updates["max_retries"] = providerDefaultMaxRetries(req.ProviderName)
+			}
+		}
+		if err := model.DB.Model(&configData).Updates(updates).Error; err != nil {
+			log.Printf("[API] 更新配置失败: %v\n", err)
+			Error(c, http.StatusInternalServerError, 500, "更新配置到数据库失败: "+err.Error())
+			return
+		}
+	}
+
+	// 重新初始化 Provider 注册表
+	log.Printf("[API] 重新初始化 Provider 注册表...\n")
+	if err := provider.InitProviders(); err != nil {
+		log.Printf("[API] 重新加载 Provider 失败: %v\n", err)
+		// 虽然加载失败，但配置已经保存了，所以这里我们可以选择返回成功或警告
+		// 为了严谨，我们返回一个 500
+		Error(c, http.StatusInternalServerError, 500, "配置已保存但加载失败: "+err.Error())
+		return
+	}
+
+	log.Printf("[API] 配置更新成功\n")
+	Success(c, "配置已更新并生效")
+}
+
+// ListProvidersHandler 获取所有 Provider 配置
+func ListProvidersHandler(c *gin.Context) {
+	var configs []model.ProviderConfig
+	if err := model.DB.Find(&configs).Error; err != nil {
+		Error(c, http.StatusInternalServerError, 500, "获取配置失败")
+		return
+	}
+	Success(c, configs)
+}
+
+// PromptOptimizeRequest 提示词优化请求
+type PromptOptimizeRequest struct {
+	Provider       string `json:"provider"`
+	Model          string `json:"model"`
+	Prompt         string `json:"prompt" binding:"required"`
+	ResponseFormat string `json:"response_format"`
+}
+
+// OptimizePromptHandler 使用 OpenAI 标准接口优化提示词
+func OptimizePromptHandler(c *gin.Context) {
+	var req PromptOptimizeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Error(c, http.StatusBadRequest, 400, err.Error())
+		return
+	}
+
+	result, err := promptopt.OptimizePrompt(c.Request.Context(), promptopt.Request{
+		Provider: req.Provider,
+		Model:    req.Model,
+		Prompt:   req.Prompt,
+		Mode: func() string {
+			if strings.TrimSpace(req.ResponseFormat) == "" {
+				return promptopt.ModeText
+			}
+			return req.ResponseFormat
+		}(),
+	})
+	if err != nil {
+		Error(c, http.StatusBadRequest, 400, err.Error())
+		return
+	}
+
+	Success(c, gin.H{"prompt": result.Prompt})
+}
+
+// GenerateHandler 处理图片生成请求
+func GenerateHandler(c *gin.Context) {
+	var req GenerateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Error(c, http.StatusBadRequest, 400, err.Error())
+		return
+	}
+
+	// 1. 获取并校验 Provider
+	p := provider.GetProvider(req.Provider)
+	if p == nil {
+		Error(c, http.StatusBadRequest, 400, "未找到指定的 Provider: "+req.Provider)
+		return
+	}
+
+	if req.Params == nil {
+		req.Params = map[string]interface{}{}
+	}
+	diagnostic.AttachVerboseFlag(req.Params, diagnostic.VerboseEnabled(req.Params))
+	promptOptimizeMode := promptopt.ExtractMode(req.Params)
+	if promptOptimizeMode != promptopt.ModeOff {
+		promptopt.ApplyPromptHints(
+			req.Params,
+			promptopt.ExtractPrompt(req.Params),
+			promptOptimizeMode,
+			promptopt.ExtractProvider(req.Params),
+			promptopt.ExtractModel(req.Params),
+		)
+	}
+	modelID := provider.ResolveModelID(provider.ModelResolveOptions{
+		ProviderName: req.Provider,
+		Purpose:      provider.PurposeImage,
+		RequestModel: req.ModelID,
+		Params:       req.Params,
+		Config:       fetchProviderConfig(req.Provider),
+	}).ID
+	if modelID != "" {
+		req.Params["model_id"] = modelID
+	}
+
+	// 2. 校验参数（包含你提到的比例和分辨率）
+	if err := p.ValidateParams(req.Params); err != nil {
+		Error(c, http.StatusBadRequest, 400, err.Error())
+		return
+	}
+
+	taskID := uuid.New().String()
+	prompt, _ := req.Params["prompt"].(string)
+	if prompt == "" {
+		Error(c, http.StatusBadRequest, 400, "params.prompt 不能为空")
+		return
+	}
+
+	taskModel := &model.Task{
+		TaskID:             taskID,
+		Prompt:             prompt,
+		PromptOriginal:     prompt,
+		PromptOptimizeMode: promptOptimizeMode,
+		ProviderName:       req.Provider,
+		ModelID:            modelID,
+		TotalCount:         1, // 目前单次请求只生成一张，后续可扩展
+		Status:             "pending",
+		ConfigSnapshot:     buildConfigSnapshot(req.Provider, modelID, req.Params),
+	}
+
+	if count, ok := req.Params["count"].(float64); ok {
+		taskModel.TotalCount = int(count)
+	} else if count, ok := req.Params["count"].(int); ok {
+		taskModel.TotalCount = count
+	}
+
+	if err := model.DB.Create(taskModel).Error; err != nil {
+
+		Error(c, http.StatusInternalServerError, 500, "创建任务失败")
+		return
+	}
+
+	// 自动关联到当前月份文件夹
+	monthFolder, err := getOrCreateMonthFolder(model.DB, time.Now())
+	if err != nil {
+		log.Printf("[API] 警告: 获取或创建月份文件夹失败: %v\n", err)
+	} else {
+		taskModel.FolderID = strconv.FormatUint(uint64(monthFolder.ID), 10)
+		// 保存 folder_id 到数据库
+		if err := model.DB.Model(taskModel).Update("folder_id", taskModel.FolderID).Error; err != nil {
+			log.Printf("[API] 警告: 更新任务文件夹ID失败: %v\n", err)
+		} else {
+			log.Printf("[API] 任务自动关联到月份文件夹: %s (ID: %d)\n", monthFolder.Name, monthFolder.ID)
+		}
+	}
+
+	// 提交到 Worker 池
+	task := &worker.Task{
+		TaskModel: taskModel,
+		Params:    req.Params,
+	}
+	diagnostic.AttachTaskID(task.Params, taskModel.TaskID)
+
+	diagnostic.Logf(task.Params, "task_created",
+		"provider=%s model=%s count=%d prompt_len=%d prompt_hash=%s aspect_ratio=%q image_size=%q",
+		req.Provider,
+		modelID,
+		taskModel.TotalCount,
+		len([]rune(prompt)),
+		diagnostic.PromptHash(prompt),
+		strings.TrimSpace(fmt.Sprint(req.Params["aspectRatio"])),
+		strings.TrimSpace(fmt.Sprint(req.Params["imageSize"])),
+	)
+
+	if !worker.Pool.Submit(task) {
+		model.DB.Model(taskModel).Updates(map[string]interface{}{
+			"status":        "failed",
+			"error_message": "任务队列已满，请稍后再试",
+		})
+		Error(c, http.StatusServiceUnavailable, 503, "服务器繁忙，请稍后再试")
+		return
+	}
+
+	Success(c, taskModel)
+}
+
+// GenerateWithImagesHandler 处理带图片的生成请求
+func GenerateWithImagesHandler(c *gin.Context) {
+	log.Printf("[API] 收到图生图请求\n")
+	// 1. 解析 multipart 请求
+	req, err := ParseGenerateRequestFromMultipart(c)
+	if err != nil {
+		log.Printf("[API] 解析 multipart 请求失败: %v\n", err)
+		Error(c, http.StatusBadRequest, 400, "解析请求失败: "+err.Error())
+		return
+	}
+	log.Printf("[API] 请求解析成功: Prompt=%s, Provider=%s, Images=%d\n", req.Prompt, req.Provider, len(req.RefImages))
+
+	// 2. 校验 Provider
+	p := provider.GetProvider(req.Provider)
+	if p == nil {
+		Error(c, http.StatusBadRequest, 400, "未找到指定的 Provider: "+req.Provider)
+		return
+	}
+
+	// 2. 准备任务参数
+	// 将 MultipartFile 转换为 []byte，或者从 RefPaths 读取文件
+	var refImageBytes []interface{}
+	for _, file := range req.RefImages {
+		if len(file.Content) > 0 {
+			nextRefImageBytes, err := appendReferenceImageBytes(refImageBytes, file.Name, file.Content)
+			if err != nil {
+				Error(c, http.StatusBadRequest, 400, err.Error())
+				return
+			}
+			refImageBytes = nextRefImageBytes
+		}
+	}
+
+	// 处理本地路径请求 (Tauri 优化)
+	for _, path := range req.RefPaths {
+		if path != "" {
+			if !platform.IsTauriSidecar() {
+				Error(c, http.StatusBadRequest, 400, "refPaths 仅支持桌面端模式")
+				return
+			}
+			targetPath := path
+			validatedPath, validateErr := validateRefPathForTauri(path)
+			if validateErr != nil {
+				log.Printf("[API] 非法本地参考图路径: %s, err: %v\n", path, validateErr)
+				if strings.Contains(validateErr.Error(), "参考图") {
+					Error(c, http.StatusBadRequest, 400, validateErr.Error())
+				} else {
+					Error(c, http.StatusBadRequest, 400, "参考图路径不在允许目录内")
+				}
+				return
+			}
+			targetPath = filepath.Clean(validatedPath)
+			// nosemgrep -- validateRefPathForTauri resolves symlinks, restricts paths to app config/cache/temp roots, and checks regular file + size before open.
+			file, err := os.Open(targetPath) // #nosec G304
+			if err != nil {
+				log.Printf("[API] 打开本地参考图失败: %s, err: %v\n", targetPath, err)
+				Error(c, http.StatusBadRequest, 400, "读取本地参考图失败")
+				return
+			}
+			info, err := file.Stat()
+			if err != nil {
+				file.Close()
+				log.Printf("[API] 检查本地参考图失败: %s, err: %v\n", targetPath, err)
+				Error(c, http.StatusBadRequest, 400, "读取本地参考图失败")
+				return
+			}
+			if err := validateReferenceImageRegularFile(filepath.Base(targetPath), info.Mode().IsRegular()); err != nil {
+				file.Close()
+				Error(c, http.StatusBadRequest, 400, err.Error())
+				return
+			}
+			if err := validateReferenceImageCount(len(refImageBytes) + 1); err != nil {
+				file.Close()
+				Error(c, http.StatusBadRequest, 400, err.Error())
+				return
+			}
+			if err := validateReferenceImageSize(filepath.Base(targetPath), info.Size()); err != nil {
+				file.Close()
+				Error(c, http.StatusBadRequest, 400, err.Error())
+				return
+			}
+			if err := validateReferenceImagesTotalBytes(totalReferenceImageBytes(refImageBytes) + info.Size()); err != nil {
+				file.Close()
+				Error(c, http.StatusBadRequest, 400, err.Error())
+				return
+			}
+			content, err := readAndCloseReferenceImage(file, filepath.Base(targetPath))
+			if err != nil {
+				log.Printf("[API] 读取本地参考图失败: %s, err: %v\n", targetPath, err)
+				if strings.Contains(err.Error(), "参考图") {
+					Error(c, http.StatusBadRequest, 400, err.Error())
+				} else {
+					Error(c, http.StatusBadRequest, 400, "读取本地参考图失败")
+				}
+				return
+			}
+			nextRefImageBytes, err := appendReferenceImageBytes(refImageBytes, filepath.Base(targetPath), content)
+			if err != nil {
+				Error(c, http.StatusBadRequest, 400, err.Error())
+				return
+			}
+			refImageBytes = nextRefImageBytes
+		}
+	}
+
+	modelID := provider.ResolveModelID(provider.ModelResolveOptions{
+		ProviderName: req.Provider,
+		Purpose:      provider.PurposeImage,
+		RequestModel: req.ModelID,
+		Config:       fetchProviderConfig(req.Provider),
+	}).ID
+	taskParams := map[string]interface{}{
+		"prompt":           req.Prompt,
+		"provider":         req.Provider,
+		"model_id":         modelID,
+		"aspect_ratio":     req.AspectRatio,
+		"resolution_level": req.ImageSize,
+		"quality":          req.Quality,
+		"count":            req.Count,
+		"reference_images": refImageBytes, // 传递 interface 列表，方便 Provider 类型断言
+	}
+	diagnostic.AttachVerboseFlag(taskParams, req.Verbose)
+	promptOptimizeMode := promptopt.NormalizeMode(req.PromptOptimizeMode)
+	if promptOptimizeMode != promptopt.ModeOff {
+		promptopt.ApplyPromptHints(taskParams, req.Prompt, promptOptimizeMode, req.PromptOptimizeProvider, req.PromptOptimizeModel)
+	}
+
+	log.Printf("[API] 提交任务: Prompt=%s, Images=%d\n", req.Prompt, len(refImageBytes))
+
+	// 3. 校验参数
+	if err := p.ValidateParams(taskParams); err != nil {
+		Error(c, http.StatusBadRequest, 400, err.Error())
+		return
+	}
+
+	taskID := uuid.New().String()
+	taskModel := &model.Task{
+		TaskID:             taskID,
+		Prompt:             req.Prompt,
+		PromptOriginal:     req.Prompt,
+		PromptOptimizeMode: promptOptimizeMode,
+		ProviderName:       req.Provider,
+		ModelID:            modelID,
+		TotalCount:         req.Count,
+		Status:             "pending",
+		ConfigSnapshot:     buildConfigSnapshot(req.Provider, modelID, taskParams),
+	}
+
+	if err := model.DB.Create(taskModel).Error; err != nil {
+		Error(c, http.StatusInternalServerError, 500, "创建任务失败")
+		return
+	}
+	// 自动关联到当前月份文件夹
+	monthFolder, err := getOrCreateMonthFolder(model.DB, time.Now())
+	if err != nil {
+		log.Printf("[API] 警告: 获取或创建月份文件夹失败: %v\n", err)
+	} else {
+		taskModel.FolderID = strconv.FormatUint(uint64(monthFolder.ID), 10)
+		// 保存 folder_id 到数据库
+		if err := model.DB.Model(taskModel).Update("folder_id", taskModel.FolderID).Error; err != nil {
+			log.Printf("[API] 警告: 更新任务文件夹ID失败: %v\n", err)
+		} else {
+			log.Printf("[API] 任务自动关联到月份文件夹: %s (ID: %d)\n", monthFolder.Name, monthFolder.ID)
+		}
+	}
+
+	// 4. 提交到 Worker 池
+	task := &worker.Task{
+		TaskModel: taskModel,
+		Params:    taskParams,
+	}
+	diagnostic.AttachTaskID(task.Params, taskModel.TaskID)
+
+	diagnostic.Logf(task.Params, "task_created",
+		"provider=%s model=%s count=%d prompt_len=%d prompt_hash=%s aspect_ratio=%q image_size=%q ref_image_count=%d ref_path_count=%d",
+		req.Provider,
+		modelID,
+		req.Count,
+		len([]rune(req.Prompt)),
+		diagnostic.PromptHash(req.Prompt),
+		req.AspectRatio,
+		req.ImageSize,
+		len(req.RefImages),
+		len(req.RefPaths),
+	)
+
+	if !worker.Pool.Submit(task) {
+		model.DB.Model(taskModel).Updates(map[string]interface{}{
+			"status":        "failed",
+			"error_message": "任务队列已满，请稍后再试",
+		})
+		Error(c, http.StatusServiceUnavailable, 503, "服务器繁忙，请稍后再试")
+		return
+	}
+
+	Success(c, taskModel)
+}
+
+// GetTaskHandler 获取任务状态
+func GetTaskHandler(c *gin.Context) {
+	taskID := c.Param("task_id")
+	var task model.Task
+	query := model.DB.WithContext(c.Request.Context())
+	if err := query.Where("task_id = ?", taskID).First(&task).Error; err != nil {
+		Error(c, http.StatusNotFound, 404, "任务未找到")
+		return
+	}
+	if _, err := reconcileSingleTaskTimeoutOnDemand(c.Request.Context(), &task); err != nil {
+		Error(c, http.StatusInternalServerError, 500, "任务状态收敛失败")
+		return
+	}
+	enrichTaskError(&task)
+	sanitizeTaskImagePaths(&task)
+
+	Success(c, task)
+}
+
+// ListImagesHandler 获取图片列表（含搜索）
+func ListImagesHandler(c *gin.Context) {
+	if err := reconcileActiveTasksTimeoutOnDemand(c.Request.Context()); err != nil {
+		log.Printf("[API] 懒收敛超时任务失败: %v\n", err)
+	}
+
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSizeStr := strings.TrimSpace(c.Query("page_size"))
+	if pageSizeStr == "" {
+		pageSizeStr = strings.TrimSpace(c.Query("pageSize"))
+	}
+	if pageSizeStr == "" {
+		pageSizeStr = "20"
+	}
+	pageSize, _ := strconv.Atoi(pageSizeStr)
+	if pageSize <= 0 {
+		pageSize = 20
+	} else if pageSize > 100 {
+		pageSize = 100
+	}
+	keyword := c.Query("keyword")
+
+	var tasks []model.Task
+	query := model.DB.Model(&model.Task{})
+
+	if keyword != "" {
+		like := "%" + keyword + "%"
+		query = query.Where("prompt LIKE ? OR prompt_original LIKE ? OR prompt_optimized LIKE ?", like, like, like)
+	}
+
+	var total int64
+	query.Count(&total)
+
+	offset := (page - 1) * pageSize
+	if err := query.Order("status='processing' DESC, status='pending' DESC, created_at DESC").Offset(offset).Limit(pageSize).Find(&tasks).Error; err != nil {
+		Error(c, http.StatusInternalServerError, 500, "查询失败")
+		return
+	}
+	enrichTaskErrors(tasks)
+	sanitizeTaskImagePathsBatch(tasks)
+
+	Success(c, gin.H{
+		"total": total,
+		"list":  tasks,
+	})
+}
+
+// DeleteImageHandler 删除图片
+func DeleteImageHandler(c *gin.Context) {
+	id := c.Param("id")
+	var task model.Task
+	if err := model.DB.Where("task_id = ?", id).First(&task).Error; err != nil {
+		Error(c, http.StatusNotFound, 404, "图片不存在")
+		return
+	}
+
+	// 删除物理文件/OSS 文件
+	// 优先使用数据库中存储的实际路径，兼容旧数据则尝试各种格式
+	if task.LocalPath != "" {
+		// 使用实际存储的文件名
+		fileName := filepath.Base(task.LocalPath)
+		if err := storage.GlobalStorage.Delete(fileName); err != nil {
+			fmt.Printf("警告: 删除物理文件失败 %s: %v\n", fileName, err)
+		}
+	} else {
+		// 兼容旧数据：尝试各种格式
+		for _, ext := range []string{".png", ".jpg", ".gif", ".webp"} {
+			fileName := task.TaskID + ext
+			storage.GlobalStorage.Delete(fileName)
+		}
+	}
+
+	if err := model.DB.Delete(&task).Error; err != nil {
+		Error(c, http.StatusInternalServerError, 500, "删除数据库记录失败")
+		return
+	}
+
+	Success(c, "删除成功")
+}
+
+// DownloadImageHandler 下载高清原图
+func DownloadImageHandler(c *gin.Context) {
+	id := c.Param("id")
+	var task model.Task
+	if err := model.DB.Where("task_id = ?", id).First(&task).Error; err != nil {
+		Error(c, http.StatusNotFound, 404, "图片不存在")
+		return
+	}
+
+	if task.LocalPath == "" {
+		Error(c, http.StatusNotFound, 404, "本地文件路径为空")
+		return
+	}
+
+	// 检查文件是否存在
+	if _, err := os.Stat(task.LocalPath); os.IsNotExist(err) {
+		Error(c, http.StatusNotFound, 404, "本地文件不存在")
+		return
+	}
+
+	// 根据实际文件扩展名设置下载文件名
+	ext := filepath.Ext(task.LocalPath)
+	if ext == "" {
+		ext = ".png" // 默认使用 .png
+	}
+	fileName := fmt.Sprintf("%s%s", task.TaskID, ext)
+	c.Header("Content-Description", "File Transfer")
+	c.Header("Content-Transfer-Encoding", "binary")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileName))
+	c.Header("Content-Type", "application/octet-stream")
+	c.File(task.LocalPath)
+}
+
+func getOptimizeSystemPrompt(forceJSON bool) string {
+	if forceJSON {
+		prompt := strings.TrimSpace(config.GlobalConfig.Prompts.OptimizeSystemJSON)
+		if prompt == "" {
+			return config.DefaultOptimizeSystemJSONPrompt
+		}
+		return prompt
+	}
+	prompt := strings.TrimSpace(config.GlobalConfig.Prompts.OptimizeSystem)
+	if prompt == "" {
+		return config.DefaultOptimizeSystemPrompt
+	}
+	return prompt
+}
+
+func callGeminiOptimize(ctx context.Context, cfg *model.ProviderConfig, modelName, prompt string, forceJSON bool) (string, error) {
+	return provider.GeminiOptimizeText(ctx, cfg, modelName, getOptimizeSystemPrompt(forceJSON), prompt, forceJSON)
+}
+
+func callOpenAIOptimize(ctx context.Context, cfg *model.ProviderConfig, modelName, prompt string, forceJSON bool) (string, error) {
+	return provider.OpenAIOptimizeText(ctx, cfg, modelName, getOptimizeSystemPrompt(forceJSON), prompt, forceJSON)
+}
+
+func buildModelsJSON(_ string, modelID, _ string) string {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return ""
+	}
+	payload := []map[string]interface{}{
+		{
+			"id":      modelID,
+			"name":    modelID,
+			"default": true,
+		},
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// ImageToPromptRequest 图片逆向提示词请求
+type ImageToPromptRequest struct {
+	Provider string `form:"provider"`
+	Model    string `form:"model"`
+}
+
+// 图片上传大小限制常量
+const maxImageUploadSize = 20 * 1024 * 1024 // 20MB
+
+// ImageToPromptHandler 图片逆向提示词处理函数
+// 用户上传图片，后端分析图片内容并生成提示词
+func ImageToPromptHandler(c *gin.Context) {
+	log.Printf("[API] 收到图片逆向提示词请求\n")
+
+	// 限制请求体大小，防止 DoS 攻击
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxImageUploadSize)
+
+	// 1. 解析请求参数
+	providerName := strings.TrimSpace(strings.ToLower(c.PostForm("provider")))
+	if providerName == "" {
+		providerName = "gemini-chat"
+	}
+	if providerName == "openai" {
+		providerName = "openai-chat"
+	}
+	if providerName == "gemini" {
+		providerName = "gemini-chat"
+	}
+
+	// 2. 获取 Provider 配置
+	var cfg model.ProviderConfig
+	if err := model.DB.Where("provider_name = ?", providerName).First(&cfg).Error; err != nil {
+		Error(c, http.StatusBadRequest, 400, "未找到指定的 Provider: "+providerName)
+		return
+	}
+	if strings.TrimSpace(cfg.APIKey) == "" {
+		Error(c, http.StatusBadRequest, 400, "Provider API Key 未配置")
+		return
+	}
+
+	// 3. 解析模型名称
+	modelName := provider.ResolveModelID(provider.ModelResolveOptions{
+		ProviderName: providerName,
+		Purpose:      provider.PurposeChat,
+		RequestModel: c.PostForm("model"),
+		Config:       &cfg,
+	}).ID
+	if modelName == "" {
+		Error(c, http.StatusBadRequest, 400, "未找到可用的模型")
+		return
+	}
+
+	// 4. 获取图片数据（支持 multipart 文件上传或本地路径）
+	var imageData []byte
+
+	// 方式1: 从 multipart 文件上传获取
+	file, header, err := c.Request.FormFile("image")
+	if err == nil && file != nil {
+		defer file.Close()
+		// 限制读取大小，使用 LimitReader 防止读取超过限制的数据
+		limitedReader := io.LimitReader(file, maxImageUploadSize+1)
+		imageData, err = io.ReadAll(limitedReader)
+		if err != nil {
+			Error(c, http.StatusBadRequest, 400, "读取上传图片失败")
+			return
+		}
+		if len(imageData) > maxImageUploadSize {
+			Error(c, http.StatusBadRequest, 400, "图片大小超过 20MB 限制")
+			return
+		}
+		log.Printf("[API] 从文件上传获取图片: %s, 大小: %d bytes\n", header.Filename, len(imageData))
+	}
+
+	// 方式2: 从本地路径获取（Tauri 桌面端优化）
+	if len(imageData) == 0 {
+		localPath := c.PostForm("image_path")
+		if localPath != "" {
+			// 安全校验：检查路径是否合法，防止路径遍历攻击
+			cleanPath := filepath.Clean(localPath)
+			// 检查路径中是否包含可疑的遍历字符
+			if strings.Contains(cleanPath, "..") || strings.Contains(localPath, "..") {
+				Error(c, http.StatusBadRequest, 400, "非法的图片路径")
+				return
+			}
+			// 检查文件是否存在且可读
+			info, err := os.Stat(cleanPath)
+			if err != nil {
+				Error(c, http.StatusBadRequest, 400, "读取本地图片失败")
+				return
+			}
+			// 检查文件大小
+			if info.Size() > maxImageUploadSize {
+				Error(c, http.StatusBadRequest, 400, "图片大小超过 20MB 限制")
+				return
+			}
+			imageData, err = os.ReadFile(cleanPath)
+			if err != nil {
+				Error(c, http.StatusBadRequest, 400, "读取本地图片失败")
+				return
+			}
+			log.Printf("[API] 从本地路径获取图片: 大小: %d bytes\n", len(imageData))
+		}
+	}
+
+	if len(imageData) == 0 {
+		Error(c, http.StatusBadRequest, 400, "请提供图片（通过 image 文件上传或 image_path 参数）")
+		return
+	}
+
+	// 5. 获取系统提示词
+	systemPrompt := strings.TrimSpace(config.GlobalConfig.Prompts.ImageToPromptSystem)
+	if systemPrompt == "" {
+		systemPrompt = config.DefaultImageToPromptSystem
+	}
+
+	// 6. 获取用户语言偏好，动态替换语言指令占位符
+	language := c.PostForm("language")
+	log.Printf("[API] 图片逆向提示词语言参数: %s\n", language)
+	outputLangInstruction := getImageToPromptLanguageInstruction(language)
+	log.Printf("[API] 图片逆向提示词语言指令: %s\n", outputLangInstruction)
+	// 替换占位符 {{LANGUAGE_INSTRUCTION}} 为实际的语言要求
+	systemPrompt = strings.Replace(systemPrompt, "{{LANGUAGE_INSTRUCTION}}", outputLangInstruction, 1)
+
+	// 7. 调用 AI 模型分析图片
+	var result string
+	if providerName == "gemini-chat" {
+		result, err = callGeminiImageToPrompt(c.Request.Context(), &cfg, modelName, imageData, systemPrompt)
+	} else {
+		result, err = callOpenAIImageToPrompt(c.Request.Context(), &cfg, modelName, imageData, systemPrompt)
+	}
+
+	if err != nil {
+		Error(c, http.StatusBadRequest, 400, "分析图片失败: "+err.Error())
+		return
+	}
+
+	log.Printf("[API] 图片逆向提示词成功, 结果长度: %d\n", len(result))
+	Success(c, gin.H{"prompt": result})
+}
+
+// callGeminiImageToPrompt 使用 Gemini 分析图片生成提示词
+func callGeminiImageToPrompt(ctx context.Context, cfg *model.ProviderConfig, modelName string, imageData []byte, systemPrompt string) (string, error) {
+	log.Printf("[ImageToPrompt] 开始调用 Gemini API, 模型: %s, API Base: %s", modelName, cfg.APIBase)
+	startTime := time.Now()
+	result, err := provider.GeminiImageToPrompt(ctx, cfg, modelName, imageData, systemPrompt)
+	elapsed := time.Since(startTime)
+	log.Printf("[ImageToPrompt] Gemini API 调用完成, 耗时: %v", elapsed)
+
+	if err != nil {
+		log.Printf("[ImageToPrompt] Gemini API 请求失败: %v", err)
+		return "", fmt.Errorf("请求失败: %w", err)
+	}
+
+	result = strings.TrimSpace(result)
+	log.Printf("[ImageToPrompt] Gemini API 返回结果长度: %d", len(result))
+	if result == "" {
+		log.Printf("[ImageToPrompt] Gemini API 返回空结果")
+		return "", fmt.Errorf("未返回分析结果")
+	}
+	log.Printf("[ImageToPrompt] 成功获取提示词, 前100字符: %s", truncateString(result, 100))
+	return result, nil
+}
+
+// truncateString 截断字符串用于日志显示
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// getImageToPromptLanguageInstruction 根据用户语言返回逆向提示词的输出语言指令
+// 返回完整的语言输出要求，用于替换系统提示词中的 {{LANGUAGE_INSTRUCTION}} 占位符
+func getImageToPromptLanguageInstruction(language string) string {
+	// 统一小写处理
+	lang := strings.ToLower(strings.TrimSpace(language))
+	if lang == "" {
+		// 默认英文
+		return "用英文输出提示词"
+	}
+
+	// 语言映射表：语言代码 -> 输出语言指令
+	languageInstructions := map[string]string{
+		// 中文
+		"zh-cn": "用中文输出提示词",
+		"zh-tw": "用繁體中文輸出提示詞",
+		"zh-hk": "用繁體中文輸出提示詞",
+		"zh":    "用中文输出提示词",
+		// 日语
+		"ja":    "日本語でプロンプトを出力してください",
+		"ja-jp": "日本語でプロンプトを出力してください",
+		// 韩语
+		"ko":    "한국어로 프롬프트를 출력하세요",
+		"ko-kr": "한국어로 프롬프트를 출력하세요",
+		// 法语
+		"fr":    "Générez le prompt en français",
+		"fr-fr": "Générez le prompt en français",
+		// 德语
+		"de":    "Geben Sie den Prompt auf Deutsch aus",
+		"de-de": "Geben Sie den Prompt auf Deutsch aus",
+		// 西班牙语
+		"es":    "Genere el prompt en español",
+		"es-es": "Genere el prompt en español",
+		// 意大利语
+		"it":    "Restituisci il prompt in italiano",
+		"it-it": "Restituisci il prompt in italiano",
+		// 葡萄牙语
+		"pt":    "Gere o prompt em português",
+		"pt-br": "Gere o prompt em português",
+		"pt-pt": "Gere o prompt em português",
+		// 俄语
+		"ru":    "Выведите промпт на русском языке",
+		"ru-ru": "Выведите промпт на русском языке",
+		// 阿拉伯语
+		"ar":    "أخرج الموجه باللغة العربية",
+		"ar-sa": "أخرج الموجه باللغة العربية",
+		// 印地语
+		"hi":    "प्रॉम्प्ट हिंदी में आउटपुट करें",
+		"hi-in": "प्रॉम्प्ट हिंदी में आउटपुट करें",
+		// 泰语
+		"th":    "ส่งออกพรอมต์เป็นภาษาไทย",
+		"th-th": "ส่งออกพรอมต์เป็นภาษาไทย",
+		// 越南语
+		"vi":    "Xuất lời nhắc bằng tiếng Việt",
+		"vi-vn": "Xuất lời nhắc bằng tiếng Việt",
+		// 印尼语
+		"id":    "Keluarkan prompt dalam bahasa Indonesia",
+		"id-id": "Keluarkan prompt dalam bahasa Indonesia",
+		// 马来语
+		"ms":    "Keluaran prompt dalam bahasa Melayu",
+		"ms-my": "Keluaran prompt dalam bahasa Melayu",
+		// 荷兰语
+		"nl":    "Geef de prompt in het Nederlands",
+		"nl-nl": "Geef de prompt in het Nederlands",
+		// 波兰语
+		"pl":    "Wyświetl monit w języku polskim",
+		"pl-pl": "Wyświetl monit w języku polskim",
+		// 土耳其语
+		"tr":    "İstemi Türkçe olarak çıktılayın",
+		"tr-tr": "İstemi Türkçe olarak çıktılayın",
+		// 乌克兰语
+		"uk":    "Виведіть підказку українською мовою",
+		"uk-ua": "Виведіть підказку українською мовою",
+	}
+
+	// 先尝试完整匹配
+	if instruction, ok := languageInstructions[lang]; ok {
+		return instruction
+	}
+
+	// 尝试匹配语言主代码（如 zh-CN -> zh）
+	if idx := strings.Index(lang, "-"); idx > 0 {
+		mainLang := lang[:idx]
+		if instruction, ok := languageInstructions[mainLang]; ok {
+			return instruction
+		}
+	}
+
+	// 默认返回英文要求
+	return "用英文输出提示词"
+}
+
+// callOpenAIImageToPrompt 使用 OpenAI Vision 分析图片生成提示词
+func callOpenAIImageToPrompt(ctx context.Context, cfg *model.ProviderConfig, modelName string, imageData []byte, systemPrompt string) (string, error) {
+	log.Printf("[ImageToPrompt] 开始调用 OpenAI Vision API, 模型: %s, API Base: %s", modelName, cfg.APIBase)
+	startTime := time.Now()
+	result, err := provider.OpenAIImageToPrompt(ctx, cfg, modelName, imageData, systemPrompt)
+	elapsed := time.Since(startTime)
+	log.Printf("[ImageToPrompt] OpenAI API 调用完成, 耗时: %v", elapsed)
+
+	if err != nil {
+		log.Printf("[ImageToPrompt] OpenAI API 请求失败, 耗时: %v, 错误: %v", elapsed, err)
+		return "", fmt.Errorf("请求失败: %w", err)
+	}
+
+	result = strings.TrimSpace(result)
+	log.Printf("[ImageToPrompt] OpenAI API 返回结果长度: %d", len(result))
+	if result == "" {
+		log.Printf("[ImageToPrompt] OpenAI API 返回空结果")
+		return "", fmt.Errorf("未返回分析结果")
+	}
+	log.Printf("[ImageToPrompt] 成功获取提示词, 前100字符: %s", truncateString(result, 100))
+	return result, nil
+}

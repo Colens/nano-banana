@@ -1,0 +1,212 @@
+// 统一响应格式
+export interface ApiResponse<T> {
+  code: number;
+  message: string;
+  data: T;
+}
+
+// 图片模型
+export interface GeneratedImage {
+  id: string;
+  taskId: string;
+  filePath: string;
+  thumbnailPath: string;
+  fileSize: number;
+  width: number;
+  height: number;
+  mimeType: string;
+  createdAt: string;
+  // 前端辅助字段
+  url?: string;
+  thumbnailUrl?: string;
+  prompt?: string;
+  promptOriginal?: string;
+  promptOptimized?: string;
+  promptOptimizeMode?: string;
+  status?: 'pending' | 'success' | 'failed';
+  model?: string;
+  options?: string | ImageOptions;
+  errorMessage?: string;
+  errorRawMessage?: string;
+  errorCode?: string;
+  errorCategory?: string;
+  errorRequestId?: string;
+  errorRetryable?: boolean;
+  errorDetail?: string;
+  previewSource?: 'generate' | 'history';
+}
+
+// 图片选项配置
+export interface ImageOptions {
+  aspectRatio?: string;
+  imageSize?: string;
+  size?: string;
+  quality?: string;
+}
+
+// 任务模型
+export interface GenerationTask {
+  id: string;
+  prompt: string;
+  promptOriginal?: string;
+  promptOptimized?: string;
+  promptOptimizeMode?: string;
+  model: string;
+  totalCount: number;
+  completedCount: number;
+  status: 'pending' | 'processing' | 'completed' | 'failed' | 'partial';
+  options: string;
+  errorMessage: string;
+  errorRawMessage?: string;
+  errorCode?: string;
+  errorCategory?: string;
+  errorRequestId?: string;
+  errorRetryable?: boolean;
+  errorDetail?: string;
+  createdAt: string;
+  updatedAt: string;
+  images: GeneratedImage[];
+}
+
+export interface TaskFailurePayload extends Partial<GenerationTask> {
+  taskId?: string;
+}
+
+// 批量生成请求参数
+export interface BatchGenerateRequest {
+  prompt: string;
+  model: string;
+  count: number;
+  apiKey: string;
+  apiBase?: string;
+  options?: string;
+  // 正式 API 参数
+  imageSize?: string;
+  aspectRatio?: string;
+  size?: string;
+  quality?: string;
+}
+
+// 历史记录列表项（通常即为 Task）
+export type HistoryItem = GenerationTask;
+
+// 历史查询参数
+export interface HistoryQueryParams {
+    page?: number;
+    pageSize?: number;
+    keyword?: string;
+}
+
+// 历史列表响应
+export interface HistoryListResponse {
+    list: GenerationTask[];
+    total: number;
+    page: number;
+    pageSize?: number;  // 每页数量（搜索接口返回）
+    keyword?: string;   // 搜索关键词（仅搜索接口返回）
+}
+
+// 扩展的 File 类型，用于参考图上传
+export interface ExtendedFile extends File {
+  // MD5 哈希值，用于去重
+  __md5?: string;
+  // 是否被压缩过
+  __compressed?: boolean;
+  // 原始文件大小（压缩前）
+  __originalSize?: number;
+  // 本地文件路径 (Tauri 环境)
+  __path?: string;
+}
+
+// 参考图持久化信息
+export interface PersistedRefImage {
+  id: string;
+  name: string;
+  path: string;
+  origin: 'external' | 'appdata';
+  mimeType?: string;
+  size?: number;
+}
+
+// 模板市场数据
+export interface TemplateRequirement {
+  minRefs?: number;
+  note?: string;
+}
+
+export interface TemplateItem {
+  id: string;
+  title: string;
+  channels: string[];
+  materials: string[];
+  industries: string[];
+  ratio: string;
+  preview: string;
+  image: string;
+  prompt?: string;
+  tips?: string;
+  source?: TemplateSource;
+  tags?: string[];
+  requirements?: TemplateRequirement;
+}
+
+export interface TemplateSource {
+  name: string;
+  label?: string;
+  icon?: string;
+  url?: string;
+}
+
+export interface TemplateMeta {
+  channels: string[];
+  materials: string[];
+  industries: string[];
+  ratios: string[];
+}
+
+export interface TemplateListResponse {
+  meta: TemplateMeta;
+  items: TemplateItem[];
+}
+
+export interface BackendImageSource {
+  kind: 'http_url' | 'storage_relative' | string;
+  value: string;
+}
+
+// 后端 Task 模型（用于 API 响应）
+export interface BackendTask {
+  task_id: string;
+  prompt: string;
+  prompt_original?: string;
+  prompt_optimized?: string;
+  prompt_optimize_mode?: string;
+  model_id?: string;
+  provider_name?: string;
+  local_path?: string;
+  thumbnail_path?: string;
+  image_url?: string;
+  thumbnail_url?: string;
+  image_source?: BackendImageSource;
+  thumbnail_source?: BackendImageSource;
+  width?: number;
+  height?: number;
+  created_at: string;
+  updated_at?: string;
+  status: string;
+  total_count?: number;
+  error_message?: string;
+  error_raw_message?: string;
+  error_code?: string;
+  error_category?: string;
+  error_request_id?: string;
+  error_retryable?: boolean;
+  error_detail?: string;
+  config_snapshot?: string;
+}
+
+// 后端历史列表响应
+export interface BackendHistoryResponse {
+  list: BackendTask[];
+  total: number;
+}

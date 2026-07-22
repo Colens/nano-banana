@@ -1,0 +1,463 @@
+name: 自动打包发布
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: 发布前检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取源代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go 环境
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: './backend/go.mod'
+          cache-dependency-path: './backend/go.sum'
+
+      - name: 后端代码检查
+        run: go vet ./...
+        working-directory: ./backend
+
+      - name: 后端编译检查
+        run: go build ./...
+        working-directory: ./backend
+
+      - name: 安装 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: './desktop/package-lock.json'
+
+      - name: 安装前端依赖
+        run: npm ci
+        working-directory: ./desktop
+
+      - name: 前端构建检查
+        run: npm run build
+        working-directory: ./desktop
+
+  build-and-release:
+    needs: test
+    name: 构建并发布 - ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS Apple Silicon 包（原生）
+          - name: macOS (Apple Silicon)
+            platform: macos-latest
+            tauriArgs: '--target aarch64-apple-darwin'
+          # macOS 通用包（Universal 2：arm64 + x86_64）
+          - name: macOS (Universal)
+            platform: macos-latest
+            tauriArgs: '--target universal-apple-darwin'
+          # Windows 安装包（使用 NSIS，避免 WiX/Light.exe 失败导致整条流水线挂掉）
+          - name: Windows (x64)
+            platform: windows-latest
+            tauriArgs: '--bundles nsis'
+    runs-on: ${{ matrix.platform }}
+    env:
+      # Tauri Updater 签名密钥（用于生成 *.sig 与 latest.json）
+      # 需要在仓库 Secrets 中配置：TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD（可为空）
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+    steps:
+      - name: 拉取源代码
+        uses: actions/checkout@v4
+
+      - name: 安装系统依赖 (Ubuntu)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - name: 获取当前时间 (北京时间)
+        shell: bash
+        run: |
+          # macOS runner 使用 BSD date，不支持 GNU 的 `-d` 参数；用 TZ 方式兼容 macOS/Linux
+          BUILD_TIME=$(TZ=Asia/Shanghai date "+%Y-%m-%d %H:%M:%S")
+          echo "BUILD_TIME=$BUILD_TIME" >> $GITHUB_ENV
+        if: runner.os != 'Windows'
+
+      - name: 获取当前时间 (北京时间 - Windows)
+        shell: pwsh
+        run: |
+          $buildTime = (Get-Date).ToUniversalTime().AddHours(8).ToString("yyyy-MM-dd HH:mm:ss")
+          echo "BUILD_TIME=$buildTime" >> $env:GITHUB_ENV
+        if: runner.os == 'Windows'
+
+      - name: 安装 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: './desktop/package-lock.json'
+
+      - name: 安装 Rust 环境
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # macOS 通用包需要同时具备 arm64 + x86_64 两个 target
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: 获取完整 Git 历史
+        run: git fetch --prune --unshallow || git fetch --prune
+
+      - name: Rust 缓存
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './desktop/src-tauri -> target'
+
+      - name: 安装 Go 环境
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: './backend/go.mod'
+          cache-dependency-path: './backend/go.sum'
+
+      - name: 生成 Release Notes
+        id: release_notes
+        shell: bash
+        run: bash scripts/generate-changelog.sh "${{ github.ref_name }}" "https://github.com/${{ github.repository }}" >> "$GITHUB_OUTPUT"
+
+      - name: 准备 Go 边车程序
+        shell: bash
+        run: |
+          mkdir -p desktop/src-tauri/bin
+          if [ "${{ matrix.platform }}" = "windows-latest" ]; then
+            cd backend && CGO_ENABLED=1 GOOS=windows GOARCH=amd64 go build -o ../desktop/src-tauri/bin/server-x86_64-pc-windows-msvc.exe cmd/server/main.go
+          else
+            cd backend && CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -o ../desktop/src-tauri/bin/server-aarch64-apple-darwin cmd/server/main.go
+            cd .. && cd backend && CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -o ../desktop/src-tauri/bin/server-x86_64-apple-darwin cmd/server/main.go
+
+            # Universal target 是“虚拟 target”，Tauri 期望用户提供一个通用的 sidecar（二进制需自行 lipo 合并）
+            if [ "${{ matrix.name }}" = "macOS (Universal)" ]; then
+              lipo -create \
+                ../desktop/src-tauri/bin/server-aarch64-apple-darwin \
+                ../desktop/src-tauri/bin/server-x86_64-apple-darwin \
+                -output ../desktop/src-tauri/bin/server-universal-apple-darwin
+              chmod +x ../desktop/src-tauri/bin/server-universal-apple-darwin
+            fi
+          fi
+
+      - name: 安装前端依赖
+        run: npm ci
+        working-directory: ./desktop
+
+      - name: 导入 Apple 签名证书 (macOS)
+        id: import_apple_cert
+        if: matrix.platform == 'macos-latest'
+        continue-on-error: true
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${APPLE_CERTIFICATE:-}" ] || [ -z "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
+            echo "No APPLE_CERTIFICATE/APPLE_CERTIFICATE_PASSWORD provided, skip signing." >&2
+            exit 1
+          fi
+
+          CERT_PATH="$RUNNER_TEMP/tauri-signing-certificate.p12"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security list-keychains -d user -s build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import "$CERT_PATH" -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          security find-identity -v -p codesigning build.keychain
+
+          CERT_ID="$(security find-identity -v -p codesigning build.keychain | awk -F '\"' '/\"/ {print $2; exit}')"
+          if [ -z "$CERT_ID" ]; then
+            echo "No codesigning identity found in keychain" >&2
+            exit 1
+          fi
+          echo "APPLE_SIGNING_IDENTITY=$CERT_ID" >> "$GITHUB_ENV"
+
+      - name: 构建并发布到 GitHub Release (macOS Signed)
+        if: matrix.platform == 'macos-latest' && steps.import_apple_cert.outcome == 'success'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
+        with:
+          projectPath: './desktop'
+          args: ${{ matrix.tauriArgs }}
+          tagName: ${{ github.ref_name }}
+          releaseName: '大香蕉 AI ${{ github.ref_name }}'
+          releaseBody: |
+            ## 🎨 大香蕉 AI - 创作从未如此简单
+
+            ${{ steps.release_notes.outputs.body }}
+
+            ### 📦 包含组件
+            - 桌面客户端 (Tauri)
+            - 本地推理引擎 (Go Sidecar)
+
+            ---
+            *由 GitHub Actions 自动构建发布 - ${{ env.BUILD_TIME }}*
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          includeRelease: true
+
+      - name: 构建并发布到 GitHub Release (macOS Unsigned)
+        if: matrix.platform == 'macos-latest' && steps.import_apple_cert.outcome != 'success'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: './desktop'
+          args: ${{ matrix.tauriArgs }} --no-sign
+          tagName: ${{ github.ref_name }}
+          releaseName: '大香蕉 AI ${{ github.ref_name }}'
+          releaseBody: |
+            ## 🎨 大香蕉 AI - 创作从未如此简单
+
+            ${{ steps.release_notes.outputs.body }}
+
+            ### 📦 包含组件
+            - 桌面客户端 (Tauri)
+            - 本地推理引擎 (Go Sidecar)
+
+            ---
+            *由 GitHub Actions 自动构建发布 - ${{ env.BUILD_TIME }}*
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          includeRelease: true
+
+      # 注意：macOS 下如果使用 `--no-sign`，会同时跳过 Updater(minisign)签名。
+      # 为确保 App 内“检查更新”可用，这里统一对 .app.tar.gz 生成并上传 .sig（覆盖同名文件，便于重跑）。
+      # 若仓库未配置 TAURI_SIGNING_PRIVATE_KEY，则跳过签名，不影响 exe/dmg 安装包发布。
+      - name: 生成并上传 Updater 签名 (macOS)
+        if: matrix.platform == 'macos-latest'
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY is empty, skip updater signing." >&2
+            exit 0
+          fi
+
+          REPO="${{ github.repository }}"
+          TAG="${{ github.ref_name }}"
+
+          cd desktop
+
+          KEY_PATH="$RUNNER_TEMP/tauri-updater.key"
+          printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" > "$KEY_PATH"
+
+          TARGET_DIR="src-tauri/target"
+          # matrix.tauriArgs 形如: "--target aarch64-apple-darwin" / "--target universal-apple-darwin"
+          TARGET_TRIPLE="$(echo "${{ matrix.tauriArgs }}" | sed -E 's/.*--target[[:space:]]+([^[:space:]]+).*/\1/')"
+          BUNDLE_DIR="$TARGET_DIR/$TARGET_TRIPLE/release/bundle/macos"
+
+          UPDATE_BUNDLE="$(ls -1 "$BUNDLE_DIR"/*.app.tar.gz | head -n 1 || true)"
+          if [ -z "$UPDATE_BUNDLE" ]; then
+            echo "Updater bundle not found in: $BUNDLE_DIR" >&2
+            ls -la "$BUNDLE_DIR" || true
+            exit 1
+          fi
+
+          # 生成 .sig（输出路径为 <file>.sig）
+          npm run -s tauri -- signer sign -f "$KEY_PATH" -p "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" "$UPDATE_BUNDLE"
+
+          SIG_PATH="${UPDATE_BUNDLE}.sig"
+          if [ ! -f "$SIG_PATH" ]; then
+            echo "Signature not generated: $SIG_PATH" >&2
+            exit 1
+          fi
+
+          # 上传到 Release（覆盖同名文件，便于重跑）
+          # 注意：tauri-action 可能会在上传时重命名 updater bundle（例如：AI_aarch64.app.tar.gz）。
+          # 为确保 latest.json 能通过 "<bundle>.sig" 找到签名，这里把本地生成的 .sig 重命名成 Release 上的 bundle 文件名 + .sig 再上传。
+          if [ "$TARGET_TRIPLE" = "universal-apple-darwin" ]; then
+            MATCH_RE="universal.*\\.app\\.tar\\.gz$"
+          else
+            MATCH_RE="aarch64.*\\.app\\.tar\\.gz$"
+          fi
+
+          REMOTE_BUNDLE_NAME="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' | grep -iE "$MATCH_RE" | head -n 1 || true)"
+          if [ -z "$REMOTE_BUNDLE_NAME" ]; then
+            # 兜底：如果没有按架构命名，直接取第一个 *.app.tar.gz
+            REMOTE_BUNDLE_NAME="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' | grep -iE '\\.app\\.tar\\.gz$' | head -n 1 || true)"
+          fi
+
+          if [ -z "$REMOTE_BUNDLE_NAME" ]; then
+            echo "Cannot find uploaded updater bundle in GitHub Release assets for $TAG" >&2
+            gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' || true
+            exit 1
+          fi
+
+          REMOTE_SIG_NAME="${REMOTE_BUNDLE_NAME}.sig"
+          cp "$SIG_PATH" "$REMOTE_SIG_NAME"
+          gh release upload "$TAG" "$REMOTE_SIG_NAME" --clobber --repo "$REPO"
+
+      - name: 构建并发布到 GitHub Release (Windows)
+        if: matrix.platform == 'windows-latest' && env.TAURI_SIGNING_PRIVATE_KEY != ''
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: './desktop'
+          args: ${{ matrix.tauriArgs }}
+          tagName: ${{ github.ref_name }}
+          releaseName: '大香蕉 AI ${{ github.ref_name }}'
+          releaseBody: |
+            ## 🎨 大香蕉 AI - 创作从未如此简单
+
+            ${{ steps.release_notes.outputs.body }}
+
+            ### 📦 包含组件
+            - 桌面客户端 (Tauri)
+            - 本地推理引擎 (Go Sidecar)
+
+            ---
+            *由 GitHub Actions 自动构建发布 - ${{ env.BUILD_TIME }}*
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          includeRelease: true
+
+      - name: 构建并发布到 GitHub Release (Windows Unsigned)
+        if: matrix.platform == 'windows-latest' && env.TAURI_SIGNING_PRIVATE_KEY == ''
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: './desktop'
+          args: ${{ matrix.tauriArgs }} --no-sign
+          tagName: ${{ github.ref_name }}
+          releaseName: '大香蕉 AI ${{ github.ref_name }}'
+          releaseBody: |
+            ## 🎨 大香蕉 AI - 创作从未如此简单
+
+            ${{ steps.release_notes.outputs.body }}
+
+            ### 📦 包含组件
+            - 桌面客户端 (Tauri)
+            - 本地推理引擎 (Go Sidecar)
+
+            ---
+            *由 GitHub Actions 自动构建发布 - ${{ env.BUILD_TIME }}*
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: false
+          includeRelease: true
+
+  # 生成/刷新 latest.json（给 Tauri Updater 使用）
+  # 说明：当前流水线是 matrix 并行构建，tauri-action 在某些组合/重跑场景下可能不会自动上传 latest.json。
+  # 这里统一在所有平台构建完成后，根据 Release 资产生成 latest.json 并上传（保证 App 内“检查更新”可用）。
+  # 若缺少 .sig（未配置签名密钥），则跳过 latest.json，不影响安装包下载。
+  publish-updater-json:
+    name: 发布 Updater latest.json
+    needs: build-and-release
+    if: always()
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: 生成 latest.json 并上传
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          TAG="${{ github.ref_name }}"
+          REPO="${{ github.repository }}"
+
+          echo "Fetching release info: $REPO $TAG"
+          gh api -H 'Accept: application/vnd.github+json' "repos/${REPO}/releases/tags/${TAG}" > release.json
+
+          # 使用 python 构建 platforms 映射（从 Release 资产里找 bundle 与 .sig）
+          python - <<'PY'
+          import json, re, urllib.request
+
+          with open("release.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+          tag = data.get("tag_name") or ""
+          version = tag[1:] if tag.startswith("v") else tag
+
+          assets = data.get("assets") or []
+          assets_by_name = {a.get("name"): a for a in assets if a.get("name")}
+
+          def find_asset(patterns):
+            for pat in patterns:
+              rx = re.compile(pat)
+              for name, a in assets_by_name.items():
+                if rx.search(name):
+                  return a
+            return None
+
+          # macOS: updater bundle 是 *.app.tar.gz + *.app.tar.gz.sig
+          mac_arm = find_asset([r"(?i)aarch64.*\.app\.tar\.gz$", r"(?i)\.app\.tar\.gz$.*aarch64"])
+          mac_universal = find_asset([r"(?i)universal.*\.app\.tar\.gz$", r"(?i)\.app\.tar\.gz$.*universal"])
+
+          # windows: createUpdaterArtifacts=true 模式下，updater 复用 setup.exe + setup.exe.sig
+          win_exe = find_asset([r"(?i)_x64-setup\.exe$"])
+
+          # 对应 .sig（优先同名 + .sig）
+          def sig_for(asset):
+            if not asset:
+              return None
+            name = asset["name"]
+            return assets_by_name.get(name + ".sig")
+
+          mac_arm_sig = sig_for(mac_arm)
+          mac_universal_sig = sig_for(mac_universal)
+          win_sig = sig_for(win_exe)
+
+          def fetch_text(url):
+            with urllib.request.urlopen(url) as f:
+              return f.read().decode("utf-8").strip()
+
+          platforms = {}
+          # Apple Silicon：优先 aarch64；若缺失则回退到 universal
+          if mac_arm and mac_arm_sig:
+            platforms["darwin-aarch64"] = {"url": mac_arm["browser_download_url"], "signature": fetch_text(mac_arm_sig["browser_download_url"])}
+          elif mac_universal and mac_universal_sig:
+            platforms["darwin-aarch64"] = {"url": mac_universal["browser_download_url"], "signature": fetch_text(mac_universal_sig["browser_download_url"])}
+
+          # Intel：使用 universal 更新包
+          if mac_universal and mac_universal_sig:
+            platforms["darwin-x86_64"] = {"url": mac_universal["browser_download_url"], "signature": fetch_text(mac_universal_sig["browser_download_url"])}
+
+          if win_exe and win_sig:
+            platforms["windows-x86_64"] = {"url": win_exe["browser_download_url"], "signature": fetch_text(win_sig["browser_download_url"])}
+
+          if not platforms:
+            print("no signed updater platforms collected; skip latest.json")
+            raise SystemExit(0)
+
+          pub_date = data.get("published_at") or data.get("created_at") or ""
+          notes = data.get("body") or ""
+          out = {"version": version or tag, "notes": notes, "pub_date": pub_date, "platforms": platforms}
+
+          with open("latest.json", "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+          print("Generated latest.json with platforms:", ", ".join(platforms.keys()))
+          PY
+
+          gh release upload "$TAG" latest.json --clobber --repo "$REPO"
