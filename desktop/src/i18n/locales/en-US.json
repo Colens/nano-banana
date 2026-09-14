@@ -447,7 +447,12 @@
         "8_1": "8:1 (Ultra-wide Panorama)",
         "9_16": "9:16 (Mobile)",
         "16_9": "16:9 (Widescreen)",
-        "21_9": "21:9 (Ultra-wide)"
+        "21_9": "21:9 (Ultra-wide)",
+        "9_21": "9:21 (Ultra-tall)",
+        "1_2": "1:2 (Portrait 1:2)",
+        "2_1": "2:1 (Landscape 2:1)",
+        "1_3": "1:3 (Ultra-tall Portrait)",
+        "3_1": "3:1 (Ultra-wide Landscape)"
       },
       "ratioAutoAdjusted": "Aspect ratio {{from}} is unsupported and was adjusted to {{to}}"
     },

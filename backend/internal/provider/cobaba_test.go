@@ -6,11 +6,12 @@ import (
 
 func TestNormalizeCobabaBaseURL(t *testing.T) {
 	cases := map[string]string{
-		"":                                  "https://cobabaai.com/v1",
-		"https://cobabaai.com":              "https://cobabaai.com/v1",
-		"https://cobabaai.com/v1":           "https://cobabaai.com/v1",
-		"https://cobabaai.com/v1/":          "https://cobabaai.com/v1",
-		"https://cobabaai.com/v1/api/generate": "https://cobabaai.com/v1",
+		"":                                         "https://cobabaai.com/v1",
+		"https://cobabaai.com":                     "https://cobabaai.com/v1",
+		"https://cobabaai.com/v1":                  "https://cobabaai.com/v1",
+		"https://cobabaai.com/v1/":                 "https://cobabaai.com/v1",
+		"https://cobabaai.com/v1/api/generate":     "https://cobabaai.com/v1",
+		"https://cobabaai.com/v1/api/result":       "https://cobabaai.com/v1",
 		"https://cobabaai.com/v1/draw/nano-banana": "https://cobabaai.com/v1",
 	}
 	for input, want := range cases {

@@ -7,8 +7,9 @@ import {
   getModelAspectRatios,
   isUsingNativeImageSize,
   isQualityControlSupported,
-  OPENAI_IMAGE_SIZE_OPTIONS,
-  OPENAI_IMAGE_QUALITY_OPTIONS
+  getImageQualityOptions,
+  getImageResolutionOptions,
+  OPENAI_IMAGE_SIZE_OPTIONS
 } from '../../store/configStore';
 import { Select } from '../common/Select';
 import { Input } from '../common/Input';
@@ -49,8 +50,16 @@ export function BatchSettings() {
   );
 
   const supportedRatios = useMemo(() => getModelAspectRatios(imageModel), [imageModel]);
+  const resolutionOptions = useMemo(
+    () => getImageResolutionOptions(imageProvider, imageModel),
+    [imageProvider, imageModel]
+  );
+  const qualityOptions = useMemo(
+    () => getImageQualityOptions(imageProvider, imageModel),
+    [imageProvider, imageModel]
+  );
   const useNativeSize = isUsingNativeImageSize(imageProvider, imageModel);
-  const useQuality = isQualityControlSupported(imageProvider);
+  const useQuality = isQualityControlSupported(imageProvider, imageModel);
   const showAutoReferenceHint = !useNativeSize && aspectRatio === 'auto' && refFiles.length > 0;
 
   useEffect(() => {
@@ -63,6 +72,21 @@ export function BatchSettings() {
       toast.info(t('config.batch.ratioAutoAdjusted', { from: aspectRatio, to: newRatio }));
     }
   }, [useNativeSize, imageModel, aspectRatio, setAspectRatio, supportedRatios, t]);
+
+  useEffect(() => {
+    if (useNativeSize) {
+      return;
+    }
+    if (resolutionOptions.length > 0 && !resolutionOptions.includes(imageSize)) {
+      setImageSize(resolutionOptions[0]);
+    }
+  }, [useNativeSize, imageSize, resolutionOptions, setImageSize]);
+
+  useEffect(() => {
+    if (qualityOptions.length > 0 && !qualityOptions.some((option) => option.value === imageQuality)) {
+      setImageQuality(qualityOptions[0].value);
+    }
+  }, [imageQuality, qualityOptions, setImageQuality]);
 
   return (
     <div className="space-y-3" data-onboarding="resolution-ratio">
@@ -98,9 +122,9 @@ export function BatchSettings() {
                   </Select>
                 ) : (
                   <Select value={imageSize} onChange={(e) => setImageSize(e.target.value)} className="h-9 text-sm">
-                      <option value="1K">{t('config.batch.resolution1k')}</option>
-                      <option value="2K">{t('config.batch.resolution2k')}</option>
-                      <option value="4K">{t('config.batch.resolution4k')}</option>
+                      {resolutionOptions.includes('1K') ? <option value="1K">{t('config.batch.resolution1k')}</option> : null}
+                      {resolutionOptions.includes('2K') ? <option value="2K">{t('config.batch.resolution2k')}</option> : null}
+                      {resolutionOptions.includes('4K') ? <option value="4K">{t('config.batch.resolution4k')}</option> : null}
                   </Select>
                 )}
             </div>
@@ -110,7 +134,7 @@ export function BatchSettings() {
           <div className="space-y-1">
             <label className="text-xs text-gray-500">{t('config.batch.quality')}</label>
             <Select value={imageQuality} onChange={(e) => setImageQuality(e.target.value)} className="h-9 text-sm">
-              {OPENAI_IMAGE_QUALITY_OPTIONS.map((option) => (
+              {qualityOptions.map((option) => (
                 <option key={option.value} value={option.value}>{option.label}</option>
               ))}
             </Select>

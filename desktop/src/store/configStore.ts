@@ -13,11 +13,19 @@ const OPENAI_IMAGE_MODELS = {
 } as const;
 
 const COBABA_IMAGE_MODELS = {
+  GPT_IMAGE_2: { value: 'gpt-image-2', label: 'GPT Image 2' },
+  GPT_IMAGE_2_5: { value: 'gpt-image-2.5', label: 'GPT Image 2.5' },
+  GPT_IMAGE_2_VIP: { value: 'gpt-image-2-vip', label: 'GPT Image 2 VIP' },
+  GPT_IMAGE_2_5_FLARE: { value: 'gpt-image-2.5-flare', label: 'GPT Image 2.5 Flare' },
+  GPT_IMAGE_2_5_SUNBURST: { value: 'gpt-image-2.5-sunburst', label: 'GPT Image 2.5 Sunburst' },
   NANO_BANANA_2: { value: 'nano-banana-2', label: 'Nano Banana 2' },
   NANO_BANANA_FAST: { value: 'nano-banana-fast', label: 'Nano Banana Fast' },
   NANO_BANANA_PRO: { value: 'nano-banana-pro', label: 'Nano Banana Pro' },
-  GPT_IMAGE_2: { value: 'gpt-image-2', label: 'GPT Image 2' },
 } as const;
+
+const COBABA_GPT_IMAGE_RATIOS = ['auto', '1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '5:4', '4:5', '21:9', '9:21', '1:2', '2:1'] as const;
+const COBABA_GPT_IMAGE_VIP_RATIOS = ['auto', '1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '5:4', '4:5', '21:9', '9:21', '1:3', '3:1', '2:1', '1:2'] as const;
+const COBABA_NANO_BANANA_RATIOS = ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'] as const;
 
 export const OPENAI_IMAGE_SIZE_OPTIONS = [
   { value: 'auto', label: 'Auto' },
@@ -45,10 +53,14 @@ export const OPENAI_IMAGE_MODEL_OPTIONS = [
 ] as const;
 
 export const COBABA_IMAGE_MODEL_OPTIONS = [
+  { value: COBABA_IMAGE_MODELS.GPT_IMAGE_2.value, label: `${COBABA_IMAGE_MODELS.GPT_IMAGE_2.label} (${COBABA_IMAGE_MODELS.GPT_IMAGE_2.value})` },
+  { value: COBABA_IMAGE_MODELS.GPT_IMAGE_2_5.value, label: `${COBABA_IMAGE_MODELS.GPT_IMAGE_2_5.label} (${COBABA_IMAGE_MODELS.GPT_IMAGE_2_5.value})` },
+  { value: COBABA_IMAGE_MODELS.GPT_IMAGE_2_VIP.value, label: `${COBABA_IMAGE_MODELS.GPT_IMAGE_2_VIP.label} (${COBABA_IMAGE_MODELS.GPT_IMAGE_2_VIP.value})` },
+  { value: COBABA_IMAGE_MODELS.GPT_IMAGE_2_5_FLARE.value, label: `${COBABA_IMAGE_MODELS.GPT_IMAGE_2_5_FLARE.label} (${COBABA_IMAGE_MODELS.GPT_IMAGE_2_5_FLARE.value})` },
+  { value: COBABA_IMAGE_MODELS.GPT_IMAGE_2_5_SUNBURST.value, label: `${COBABA_IMAGE_MODELS.GPT_IMAGE_2_5_SUNBURST.label} (${COBABA_IMAGE_MODELS.GPT_IMAGE_2_5_SUNBURST.value})` },
   { value: COBABA_IMAGE_MODELS.NANO_BANANA_2.value, label: `${COBABA_IMAGE_MODELS.NANO_BANANA_2.label} (${COBABA_IMAGE_MODELS.NANO_BANANA_2.value})` },
   { value: COBABA_IMAGE_MODELS.NANO_BANANA_FAST.value, label: `${COBABA_IMAGE_MODELS.NANO_BANANA_FAST.label} (${COBABA_IMAGE_MODELS.NANO_BANANA_FAST.value})` },
   { value: COBABA_IMAGE_MODELS.NANO_BANANA_PRO.value, label: `${COBABA_IMAGE_MODELS.NANO_BANANA_PRO.label} (${COBABA_IMAGE_MODELS.NANO_BANANA_PRO.value})` },
-  { value: COBABA_IMAGE_MODELS.GPT_IMAGE_2.value, label: `${COBABA_IMAGE_MODELS.GPT_IMAGE_2.label} (${COBABA_IMAGE_MODELS.GPT_IMAGE_2.value})` },
 ] as const;
 
 export const IMAGE_MODEL_OPTIONS = GEMINI_IMAGE_MODEL_OPTIONS;
@@ -94,14 +106,29 @@ export const IMAGE_MODEL_CONFIG: Record<string, { aspectRatios: string[] }> = {
   [OPENAI_IMAGE_MODELS.GPT_IMAGE_2.value]: {
     aspectRatios: ['auto', '1:1', '1:4', '1:8', '2:3', '3:2', '3:4', '4:1', '4:3', '4:5', '5:4', '8:1', '9:16', '16:9', '21:9']
   },
+  [COBABA_IMAGE_MODELS.GPT_IMAGE_2.value]: {
+    aspectRatios: [...COBABA_GPT_IMAGE_RATIOS]
+  },
+  [COBABA_IMAGE_MODELS.GPT_IMAGE_2_5.value]: {
+    aspectRatios: [...COBABA_GPT_IMAGE_RATIOS]
+  },
+  [COBABA_IMAGE_MODELS.GPT_IMAGE_2_VIP.value]: {
+    aspectRatios: [...COBABA_GPT_IMAGE_VIP_RATIOS]
+  },
+  [COBABA_IMAGE_MODELS.GPT_IMAGE_2_5_FLARE.value]: {
+    aspectRatios: [...COBABA_GPT_IMAGE_VIP_RATIOS]
+  },
+  [COBABA_IMAGE_MODELS.GPT_IMAGE_2_5_SUNBURST.value]: {
+    aspectRatios: [...COBABA_GPT_IMAGE_VIP_RATIOS]
+  },
   [COBABA_IMAGE_MODELS.NANO_BANANA_2.value]: {
-    aspectRatios: ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9']
+    aspectRatios: [...COBABA_NANO_BANANA_RATIOS]
   },
   [COBABA_IMAGE_MODELS.NANO_BANANA_FAST.value]: {
-    aspectRatios: ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9']
+    aspectRatios: [...COBABA_NANO_BANANA_RATIOS]
   },
   [COBABA_IMAGE_MODELS.NANO_BANANA_PRO.value]: {
-    aspectRatios: ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9']
+    aspectRatios: [...COBABA_NANO_BANANA_RATIOS]
   }
 };
 
@@ -112,7 +139,59 @@ export const isReferenceImageSupported = (_provider: string): boolean => true;
 export const isUsingNativeImageSize = (provider: string, model?: string): boolean => (
   provider === 'openai-image' && !isUsingDynamicOpenAIImageSize(provider, model)
 );
-export const isQualityControlSupported = (provider: string): boolean => provider === 'openai-image';
+
+const isCobabaGPTImageModel = (model?: string): boolean =>
+  String(model || '').toLowerCase().startsWith('gpt-image-2');
+
+export const getImageQualityOptions = (provider: string, model?: string) => {
+  if (provider === 'openai-image') return [...OPENAI_IMAGE_QUALITY_OPTIONS];
+  if (provider !== 'cobaba') return [...OPENAI_IMAGE_QUALITY_OPTIONS];
+
+  const m = String(model || '').toLowerCase();
+  if (m.includes('sunburst')) {
+    return [
+      { value: 'low', label: 'Low' },
+      { value: 'medium', label: 'Medium' },
+      { value: 'high', label: 'High' },
+      { value: 'xhigh', label: 'XHigh' },
+      { value: 'max', label: 'Max' }
+    ];
+  }
+  if (m.includes('flare')) {
+    return [
+      { value: 'low', label: 'Low' },
+      { value: 'medium', label: 'Medium' },
+      { value: 'high', label: 'High' }
+    ];
+  }
+  if (m.includes('vip')) {
+    return [{ value: 'medium', label: 'Medium' }];
+  }
+  if (isCobabaGPTImageModel(model)) {
+    return [{ value: 'auto', label: 'Auto' }];
+  }
+  return [...OPENAI_IMAGE_QUALITY_OPTIONS];
+};
+
+export const getImageResolutionOptions = (provider: string, model?: string): string[] => {
+  if (provider === 'cobaba') {
+    const m = String(model || '').toLowerCase();
+    if (m === 'gpt-image-2' || m === 'gpt-image-2.5') {
+      return ['1K'];
+    }
+  }
+  return ['1K', '2K', '4K'];
+};
+
+export const shouldSendImageQuality = (provider: string, model?: string): boolean => {
+  if (provider === 'openai-image') return true;
+  return provider === 'cobaba' && isCobabaGPTImageModel(model);
+};
+
+export const isQualityControlSupported = (provider: string, model?: string): boolean => {
+  if (provider === 'openai-image') return true;
+  return shouldSendImageQuality(provider, model) && getImageQualityOptions(provider, model).length > 1;
+};
 
 // Helper function to get supported aspect ratios for a model
 export const getModelAspectRatios = (model: string): string[] => {

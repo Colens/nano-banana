@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image-gen-service/internal/diagnostic"
 	"image-gen-service/internal/model"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -18,6 +20,7 @@ import (
 
 // CobabaProvider 对接 Cobaba / 同类中转站的统一出图与 Nano Banana 异步接口：
 //   - POST {base}/api/generate
+//   - GET  {base}/api/result
 //   - POST {base}/draw/nano-banana
 //   - POST {base}/draw/result
 type CobabaProvider struct {
@@ -89,24 +92,39 @@ func (p *CobabaProvider) Generate(ctx context.Context, params map[string]interfa
 		return nil, err
 	}
 
+	quality := firstStringParam(params, "quality")
 	diagnostic.Logf(params, "request_prepare",
-		"provider=%s model=%s aspect_ratio=%q image_size=%q ref_image_count=%d prompt_hash=%s prompt_preview=%q",
+		"provider=%s model=%s aspect_ratio=%q image_size=%q quality=%q ref_image_count=%d prompt_hash=%s prompt_preview=%q",
 		p.Name(),
 		modelID,
 		aspectRatio,
 		imageSize,
+		quality,
 		len(refImages),
 		diagnostic.PromptHash(prompt),
 		diagnostic.Preview(prompt, 160),
 	)
 
-	images, meta, err := p.generateViaAPIGenerate(ctx, modelID, prompt, aspectRatio, imageSize, refImages, params)
-	if err != nil {
-		log.Printf("[Cobaba] /api/generate 失败，回退 /draw/nano-banana: %v", err)
+	var (
+		images [][]byte
+		meta   map[string]interface{}
+	)
+	switch {
+	case isCobabaNanoBananaModel(modelID):
 		images, meta, err = p.generateViaNanoBanana(ctx, modelID, prompt, aspectRatio, refImages, params)
 		if err != nil {
-			return nil, err
+			log.Printf("[Cobaba] /draw/nano-banana 失败，回退 /api/generate: %v", err)
+			images, meta, err = p.generateViaAPIGenerate(ctx, modelID, prompt, aspectRatio, imageSize, refImages, params)
 		}
+	default:
+		images, meta, err = p.generateViaAPIGenerate(ctx, modelID, prompt, aspectRatio, imageSize, refImages, params)
+		if err != nil && !isCobabaGPTImageModel(modelID) {
+			log.Printf("[Cobaba] /api/generate 失败，回退 /draw/nano-banana: %v", err)
+			images, meta, err = p.generateViaNanoBanana(ctx, modelID, prompt, aspectRatio, refImages, params)
+		}
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	if meta == nil {
@@ -125,18 +143,30 @@ func (p *CobabaProvider) generateViaAPIGenerate(
 	refImages []string,
 	params map[string]interface{},
 ) ([][]byte, map[string]interface{}, error) {
+	resolvedAspect := resolveCobabaAspectRatio(modelID, aspectRatio, imageSize)
 	body := map[string]interface{}{
 		"model":       modelID,
 		"prompt":      prompt,
 		"images":      refImages,
-		"aspectRatio": aspectRatio,
-		"imageSize":   imageSize,
+		"aspectRatio": resolvedAspect,
 		"replyType":   "async",
+	}
+	if quality := resolveCobabaQuality(modelID, firstStringParam(params, "quality")); quality != "" {
+		body["quality"] = quality
+	}
+	if isCobabaNanoBananaModel(modelID) && strings.TrimSpace(imageSize) != "" {
+		body["imageSize"] = imageSize
 	}
 
 	respBytes, headers, err := p.doJSONPost(ctx, p.apiBase+"/api/generate", body, params)
 	if err != nil {
+		if fail := cobabaTerminalErrorFromHTTPError(err); fail != nil {
+			return nil, nil, fail
+		}
 		return nil, nil, err
+	}
+	if fail := cobabaTerminalError(respBytes); fail != nil {
+		return nil, nil, fail
 	}
 
 	images, err := p.extractImagesFlexible(ctx, respBytes)
@@ -156,7 +186,7 @@ func (p *CobabaProvider) generateViaAPIGenerate(
 		return nil, nil, fmt.Errorf("api/generate 未返回图片且无任务 ID: %s", diagnostic.Preview(string(respBytes), 400))
 	}
 
-	images, err = p.pollDrawResult(ctx, taskID, params)
+	images, err = p.pollTaskResult(ctx, taskID, params, true)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -202,7 +232,7 @@ func (p *CobabaProvider) generateViaNanoBanana(
 		return nil, nil, fmt.Errorf("draw/nano-banana 未返回图片且无任务 ID: %s", diagnostic.Preview(string(respBytes), 400))
 	}
 
-	images, err = p.pollDrawResult(ctx, taskID, params)
+	images, err = p.pollTaskResult(ctx, taskID, params, false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -213,20 +243,39 @@ func (p *CobabaProvider) generateViaNanoBanana(
 	}, nil
 }
 
-func (p *CobabaProvider) pollDrawResult(ctx context.Context, taskID string, params map[string]interface{}) ([][]byte, error) {
+func (p *CobabaProvider) pollTaskResult(ctx context.Context, taskID string, params map[string]interface{}, preferGET bool) ([][]byte, error) {
 	deadline := time.Now().Add(8 * time.Minute)
 	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
 		deadline = dl
 	}
 
+	useGET := preferGET
 	var lastErr error
 	for attempt := 1; time.Now().Before(deadline); attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 
-		respBytes, _, err := p.doJSONPost(ctx, p.apiBase+"/draw/result", map[string]interface{}{"id": taskID}, params)
+		var (
+			respBytes []byte
+			err       error
+		)
+		if useGET {
+			query := url.Values{}
+			query.Set("id", taskID)
+			respBytes, _, err = p.doJSONGet(ctx, p.apiBase+"/api/result?"+query.Encode(), params)
+			if err != nil && shouldFallbackCobabaDrawResult(err) {
+				log.Printf("[Cobaba] GET /api/result 不可用，回退 POST /draw/result: %v", err)
+				useGET = false
+				continue
+			}
+		} else {
+			respBytes, _, err = p.doJSONPost(ctx, p.apiBase+"/draw/result", map[string]interface{}{"id": taskID}, params)
+		}
 		if err != nil {
+			if fail := cobabaTerminalErrorFromHTTPError(err); fail != nil {
+				return nil, fail
+			}
 			lastErr = err
 			log.Printf("[Cobaba] poll result 第%d次失败 task=%s err=%v", attempt, taskID, err)
 			if sleepErr := sleepWithContext(ctx, 2*time.Second); sleepErr != nil {
@@ -239,13 +288,11 @@ func (p *CobabaProvider) pollDrawResult(ctx context.Context, taskID string, para
 		diagnostic.Logf(params, "poll_status", "task_id=%s attempt=%d status=%q body_preview=%q",
 			taskID, attempt, status, diagnostic.Preview(string(respBytes), 240))
 
+		if fail := cobabaTerminalError(respBytes); fail != nil {
+			return nil, fail
+		}
+
 		switch status {
-		case "FAILED", "FAILURE", "ERROR":
-			reason := extractCobabaFailReason(respBytes)
-			if reason == "" {
-				reason = diagnostic.Preview(string(respBytes), 400)
-			}
-			return nil, fmt.Errorf("任务失败: %s", reason)
 		case "SUCCESS", "SUCCEEDED", "COMPLETED", "DONE", "FINISH", "FINISHED":
 			images, extractErr := p.extractImagesFlexible(ctx, respBytes)
 			if extractErr != nil {
@@ -278,21 +325,39 @@ func (p *CobabaProvider) doJSONPost(ctx context.Context, url string, body map[st
 	if err != nil {
 		return nil, nil, fmt.Errorf("序列化请求失败: %w", err)
 	}
+	return p.doJSONRequest(ctx, http.MethodPost, url, payloadBytes, params)
+}
 
+func (p *CobabaProvider) doJSONGet(ctx context.Context, url string, params map[string]interface{}) ([]byte, http.Header, error) {
+	return p.doJSONRequest(ctx, http.MethodGet, url, nil, params)
+}
+
+func (p *CobabaProvider) doJSONRequest(ctx context.Context, method, requestURL string, payloadBytes []byte, params map[string]interface{}) ([]byte, http.Header, error) {
+	bodyPreview := ""
+	if len(payloadBytes) > 0 {
+		bodyPreview = diagnostic.RedactSensitive(string(payloadBytes))
+	}
 	diagnostic.Logf(params, "request_payload",
-		"url=%s body=%q",
-		diagnostic.RedactSensitive(url),
-		diagnostic.RedactSensitive(string(payloadBytes)),
+		"method=%s url=%s body=%q",
+		method,
+		diagnostic.RedactSensitive(requestURL),
+		bodyPreview,
 	)
 
 	maxRetries := providerMaxRetries(p.config)
 	var elapsed time.Duration
 	resp, _, err := doRequestWithRetry(ctx, params, p.Name(), maxRetries, func(attempt int) (*http.Response, error) {
-		req, buildErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payloadBytes))
+		var reader io.Reader
+		if len(payloadBytes) > 0 {
+			reader = bytes.NewReader(payloadBytes)
+		}
+		req, buildErr := http.NewRequestWithContext(ctx, method, requestURL, reader)
 		if buildErr != nil {
 			return nil, fmt.Errorf("构建请求失败: %w", buildErr)
 		}
-		req.Header.Set("Content-Type", "application/json")
+		if len(payloadBytes) > 0 {
+			req.Header.Set("Content-Type", "application/json")
+		}
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(p.config.APIKey))
 		req.Header.Set("Connection", "close")
@@ -325,12 +390,65 @@ func (p *CobabaProvider) doJSONPost(ctx context.Context, url string, body map[st
 	)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, resp.Header.Clone(), fmt.Errorf("HTTP %d request_id=%s %s", resp.StatusCode, requestID, openAIErrorBodyPreview(respBody, 1200))
+		return nil, resp.Header.Clone(), &cobabaStatusError{
+			StatusCode: resp.StatusCode,
+			Body:       respBody,
+			Message:    fmt.Sprintf("HTTP %d request_id=%s %s", resp.StatusCode, requestID, openAIErrorBodyPreview(respBody, 1200)),
+		}
 	}
 	if len(respBody) == 0 {
 		return nil, resp.Header.Clone(), fmt.Errorf("接口未返回内容")
 	}
 	return respBody, resp.Header.Clone(), nil
+}
+
+type cobabaStatusError struct {
+	StatusCode int
+	Body       []byte
+	Message    string
+}
+
+func (e *cobabaStatusError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
+func cobabaTerminalError(resp []byte) error {
+	status := strings.ToUpper(extractCobabaStatus(resp))
+	switch status {
+	case "FAILED", "FAILURE", "ERROR", "VIOLATION":
+		reason := extractCobabaFailReason(resp)
+		if reason == "" {
+			reason = diagnostic.Preview(string(resp), 400)
+		}
+		if status == "VIOLATION" {
+			return fmt.Errorf("任务违规: %s", reason)
+		}
+		return fmt.Errorf("任务失败: %s", reason)
+	default:
+		return nil
+	}
+}
+
+func cobabaTerminalErrorFromHTTPError(err error) error {
+	var statusErr *cobabaStatusError
+	if !errors.As(err, &statusErr) {
+		return nil
+	}
+	if fail := cobabaTerminalError(statusErr.Body); fail != nil {
+		return fail
+	}
+	return nil
+}
+
+func shouldFallbackCobabaDrawResult(err error) bool {
+	var statusErr *cobabaStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	return statusErr.StatusCode == http.StatusNotFound || statusErr.StatusCode == http.StatusMethodNotAllowed
 }
 
 func (p *CobabaProvider) extractImagesFlexible(ctx context.Context, respBytes []byte) ([][]byte, error) {
@@ -515,6 +633,7 @@ func NormalizeCobabaBaseURL(apiBase string) string {
 	base = strings.TrimRight(base, "/")
 	for _, suffix := range []string{
 		"/api/generate",
+		"/api/result",
 		"/draw/nano-banana",
 		"/draw/result",
 		"/draw/completions",
@@ -603,14 +722,24 @@ func extractCobabaFailReason(resp []byte) string {
 	if err := json.Unmarshal(resp, &raw); err != nil {
 		return ""
 	}
+	if s := cobabaErrorString(raw); s != "" {
+		return s
+	}
+	if data, ok := raw["data"].(map[string]interface{}); ok {
+		if s := cobabaErrorString(data); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func cobabaErrorString(raw map[string]interface{}) string {
 	for _, key := range []string{"failReason", "fail_reason", "error", "message"} {
 		if s := asString(raw[key]); s != "" {
 			return s
 		}
-	}
-	if data, ok := raw["data"].(map[string]interface{}); ok {
-		for _, key := range []string{"failReason", "fail_reason", "error", "message"} {
-			if s := asString(data[key]); s != "" {
+		if obj, ok := raw[key].(map[string]interface{}); ok {
+			if s := asString(obj["message"]); s != "" {
 				return s
 			}
 		}
