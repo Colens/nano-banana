@@ -106,9 +106,6 @@ export const IMAGE_MODEL_CONFIG: Record<string, { aspectRatios: string[] }> = {
   [OPENAI_IMAGE_MODELS.GPT_IMAGE_2.value]: {
     aspectRatios: ['auto', '1:1', '1:4', '1:8', '2:3', '3:2', '3:4', '4:1', '4:3', '4:5', '5:4', '8:1', '9:16', '16:9', '21:9']
   },
-  [COBABA_IMAGE_MODELS.GPT_IMAGE_2.value]: {
-    aspectRatios: [...COBABA_GPT_IMAGE_RATIOS]
-  },
   [COBABA_IMAGE_MODELS.GPT_IMAGE_2_5.value]: {
     aspectRatios: [...COBABA_GPT_IMAGE_RATIOS]
   },
@@ -194,7 +191,19 @@ export const isQualityControlSupported = (provider: string, model?: string): boo
 };
 
 // Helper function to get supported aspect ratios for a model
-export const getModelAspectRatios = (model: string): string[] => {
+export const getModelAspectRatios = (model: string, provider?: string): string[] => {
+  if (provider === 'cobaba') {
+    const m = String(model || '').toLowerCase();
+    if (m === 'gpt-image-2' || m === 'gpt-image-2.5') {
+      return [...COBABA_GPT_IMAGE_RATIOS];
+    }
+    if (m.includes('vip') || m.includes('flare') || m.includes('sunburst')) {
+      return [...COBABA_GPT_IMAGE_VIP_RATIOS];
+    }
+    if (m.includes('nano-banana')) {
+      return [...COBABA_NANO_BANANA_RATIOS];
+    }
+  }
   const ratios = IMAGE_MODEL_CONFIG[model]?.aspectRatios;
   return (ratios && ratios.length > 0) ? ratios : ['1:1'];
 };

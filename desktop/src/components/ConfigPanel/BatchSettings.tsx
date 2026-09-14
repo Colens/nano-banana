@@ -49,7 +49,7 @@ export function BatchSettings() {
     }))
   );
 
-  const supportedRatios = useMemo(() => getModelAspectRatios(imageModel), [imageModel]);
+  const supportedRatios = useMemo(() => getModelAspectRatios(imageModel, imageProvider), [imageModel, imageProvider]);
   const resolutionOptions = useMemo(
     () => getImageResolutionOptions(imageProvider, imageModel),
     [imageProvider, imageModel]
